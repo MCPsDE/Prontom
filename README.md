@@ -2,14 +2,19 @@
 
 通用 Malody `.mc` 轨道映射工具。
 
-当前版本：`2.0.1`
+当前版本：`2.1.0`
 
 ## 用法
 
 ```text
-prontom.exe input.mc target_columns [source_columns]
+prontom.exe input.mc target_columns [lambda] [source_columns]
 prontom.exe --version
 ```
+
+`lambda` 省略时默认为 `0`。`lambda` 必须位于 `[0,1]`：
+
+- `lambda=0`：严格使用旧的逐 note 映射路径。
+- `lambda>0`：使用事件级多对多键型转换。
 
 如果不提供 `source_columns`，程序读取 `meta.mode_ext.column`。
 
@@ -31,6 +36,9 @@ input_to{target_columns}K.mc
 - 冻结状态会继承各源轨道已经消耗的周期位置，不会在每次 `n-k→m-k` 重建时重置。
 - 普通音符、长条头和长条尾统一遵守 `xmin * m / n` 的最小间隔约束。
 - 同一 beat 的目标列会确定性避开已占用列。
+- 事件级路径以同一精确 beat 的键型作为转换事件，并使用原谱 `xmin` 作为间隔约束。
+- 事件级路径使用确定性平衡周期控制增删 note，不使用随机。
+- 事件级路径按中心、跨度、间隙和连续性选择目标键型。
 
 ## 构建
 

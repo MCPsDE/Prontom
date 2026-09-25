@@ -8,8 +8,10 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.0.1";
+static constexpr const char* PRONTOM_VERSION = "2.1.0";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -93,6 +95,77 @@ static std::string rational_to_string(const Rational& value) {
     }
     return std::to_string(value.numerator) + "/" +
         std::to_string(value.denominator);
+}
+
+static Rational parse_lambda(const std::string& text) {
+    if (text.empty()) {
+        return Rational(0, 1);
+    }
+    if (text.front() == '-' || text.front() == '+') {
+        throw std::invalid_argument(
+            "lambda must be a rational number between 0 and 1"
+        );
+    }
+
+    try {
+        const auto slash = text.find('/');
+        if (slash != std::string::npos) {
+            const auto numerator = std::stoll(text.substr(0, slash));
+            const auto denominator = std::stoll(text.substr(slash + 1));
+            const Rational value(numerator, denominator);
+            if (value < Rational(0, 1) || Rational(1, 1) < value) {
+                throw std::invalid_argument("lambda must be between 0 and 1");
+            }
+            return value;
+        }
+
+        const auto dot = text.find('.');
+        if (dot == std::string::npos) {
+            const Rational value(std::stoll(text), 1);
+            if (value < Rational(0, 1) || Rational(1, 1) < value) {
+                throw std::invalid_argument("lambda must be between 0 and 1");
+            }
+            return value;
+        }
+
+        const auto integer_text = text.substr(0, dot);
+        const auto fraction_text = text.substr(dot + 1);
+        if (fraction_text.empty() || fraction_text.size() > 9) {
+            throw std::invalid_argument("invalid lambda");
+        }
+        std::int64_t scale = 1;
+        for (std::size_t index = 0; index < fraction_text.size(); ++index) {
+            scale *= 10;
+        }
+        const auto integer = integer_text.empty()
+            ? 0
+            : std::stoll(integer_text);
+        const auto fraction = std::stoll(fraction_text);
+        const Rational value(integer * scale + fraction, scale);
+        if (value < Rational(0, 1) || Rational(1, 1) < value) {
+            throw std::invalid_argument("lambda must be between 0 and 1");
+        }
+        return value;
+    } catch (const std::exception&) {
+        throw std::invalid_argument(
+            "lambda must be a rational number between 0 and 1"
+        );
+    }
+}
+
+static std::int64_t rational_floor(const Rational& value) {
+    if (value.numerator >= 0) {
+        return value.numerator / value.denominator;
+    }
+    return -(
+        (-value.numerator + value.denominator - 1)
+        / value.denominator
+    );
+}
+
+static long double rational_as_long_double(const Rational& value) {
+    return static_cast<long double>(value.numerator)
+        / static_cast<long double>(value.denominator);
 }
 
 static std::optional<std::int64_t> python_int(const json& value) {
@@ -1572,9 +1645,824 @@ static std::pair<std::int64_t, std::int64_t> repair_hold_results(
     return {changed, dropped};
 }
 
+struct ShapeEvent {
+    std::vector<std::size_t> indexes;
+    Rational start;
+};
+
+static std::vector<ShapeEvent> build_shape_events(
+    const std::vector<json>& ordinary_notes,
+    const std::vector<std::optional<std::int64_t>>& source_ranks,
+    const Rational& window
+) {
+    std::vector<std::size_t> indexes;
+    for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
+        if (source_ranks[index] && beat_value(ordinary_notes[index])) {
+            indexes.push_back(index);
+        }
+    }
+    std::sort(
+        indexes.begin(), indexes.end(),
+        [&](std::size_t left, std::size_t right) {
+            const auto left_beat = *beat_value(ordinary_notes[left]);
+            const auto right_beat = *beat_value(ordinary_notes[right]);
+            if (left_beat == right_beat) {
+                return left < right;
+            }
+            return left_beat < right_beat;
+        }
+    );
+
+    std::vector<ShapeEvent> events;
+    for (const auto index : indexes) {
+        const auto beat = *beat_value(ordinary_notes[index]);
+        if (events.empty() || !(beat == events.back().start)) {
+            events.push_back({{}, beat});
+        }
+        events.back().indexes.push_back(index);
+    }
+    return events;
+}
+
+static std::string shape_signature(
+    const std::vector<std::int64_t>& sources
+) {
+    std::ostringstream output;
+    for (const auto source : sources) {
+        output << source << ",";
+    }
+    return output.str();
+}
+
+static std::int64_t balanced_shape_count(
+    std::int64_t source_count,
+    const Rational& lambda,
+    std::int64_t source_columns,
+    std::int64_t target_columns,
+    std::int64_t occurrence
+) {
+    const auto denominator = static_cast<__int128>(
+        source_columns
+    ) * lambda.denominator;
+    const auto factor_numerator = static_cast<__int128>(
+        source_columns
+    ) * lambda.denominator
+        + static_cast<__int128>(lambda.numerator)
+            * (target_columns - source_columns);
+    const auto average_numerator =
+        static_cast<__int128>(source_count) * factor_numerator;
+    const auto left = static_cast<__int128>(occurrence)
+        * average_numerator / denominator;
+    const auto right = static_cast<__int128>(occurrence + 1)
+        * average_numerator / denominator;
+    const auto result = right - left;
+    if (result < 0 || result > target_columns) {
+        return std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(result), 0, target_columns
+        );
+    }
+    return static_cast<std::int64_t>(result);
+}
+
+static void add_shape_candidate(
+    std::vector<std::vector<std::int64_t>>& candidates,
+    std::vector<std::int64_t> candidate,
+    std::int64_t target_columns
+) {
+    std::sort(candidate.begin(), candidate.end());
+    candidate.erase(
+        std::unique(candidate.begin(), candidate.end()),
+        candidate.end()
+    );
+    if (candidate.size() > static_cast<std::size_t>(target_columns)) {
+        return;
+    }
+    if (std::any_of(
+            candidate.begin(), candidate.end(),
+            [target_columns](std::int64_t value) {
+                return value < 0 || value >= target_columns;
+            }
+        )) {
+        return;
+    }
+    if (std::find(candidates.begin(), candidates.end(), candidate)
+        == candidates.end()) {
+        candidates.push_back(std::move(candidate));
+    }
+}
+
+static std::vector<std::int64_t> evenly_spaced_shape(
+    std::int64_t count,
+    long double center,
+    long double span,
+    std::int64_t target_columns
+) {
+    if (count <= 0) {
+        return {};
+    }
+    if (count == 1) {
+        const auto target = static_cast<std::int64_t>(
+            std::llround(center)
+        );
+        return {std::clamp<std::int64_t>(
+            target, 0, target_columns - 1
+        )};
+    }
+
+    span = std::max(span, static_cast<long double>(count - 1));
+    span = std::min(span, static_cast<long double>(target_columns - 1));
+    auto left = center - span / 2.0L;
+    auto right = center + span / 2.0L;
+    if (left < 0) {
+        right -= left;
+        left = 0;
+    }
+    if (right >= target_columns) {
+        left -= right - (target_columns - 1);
+        right = target_columns - 1;
+    }
+    left = std::max(left, 0.0L);
+    right = std::min(right, static_cast<long double>(target_columns - 1));
+
+    std::vector<std::int64_t> result;
+    for (std::int64_t index = 0; index < count; ++index) {
+        const auto value = left + (right - left)
+            * static_cast<long double>(index)
+            / static_cast<long double>(count - 1);
+        result.push_back(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(std::llround(value)),
+            0, target_columns - 1
+        ));
+    }
+
+    for (std::int64_t index = 1; index < count; ++index) {
+        if (result[static_cast<std::size_t>(index)]
+            <= result[static_cast<std::size_t>(index - 1)]) {
+            result[static_cast<std::size_t>(index)] =
+                result[static_cast<std::size_t>(index - 1)] + 1;
+        }
+    }
+    while (!result.empty() && result.back() >= target_columns) {
+        for (auto& value : result) {
+            --value;
+        }
+    }
+    return result;
+}
+
+static std::vector<std::vector<std::int64_t>> build_shape_candidates(
+    const std::vector<std::int64_t>& source_shape,
+    std::int64_t target_count,
+    std::int64_t source_columns,
+    std::int64_t target_columns
+) {
+    std::vector<std::vector<std::int64_t>> candidates;
+    if (target_count <= 0) {
+        candidates.push_back({});
+        return candidates;
+    }
+
+    long double source_center = 0;
+    for (const auto source : source_shape) {
+        source_center += static_cast<long double>(source);
+    }
+    source_center /= std::max<std::size_t>(source_shape.size(), 1);
+    const auto source_scale = std::max(
+        source_columns - 1, std::int64_t(1)
+    );
+    const auto target_scale = std::max(
+        target_columns - 1, std::int64_t(1)
+    );
+    const auto target_center = source_center
+        * static_cast<long double>(target_scale)
+        / static_cast<long double>(source_scale);
+
+    long double source_span = 0;
+    if (!source_shape.empty()) {
+        source_span = static_cast<long double>(
+            source_shape.back() - source_shape.front()
+        );
+    }
+    const auto target_span = source_span
+        * static_cast<long double>(target_scale)
+        / static_cast<long double>(source_scale);
+
+    add_shape_candidate(
+        candidates,
+        evenly_spaced_shape(
+            target_count, target_center, target_span, target_columns
+        ),
+        target_columns
+    );
+    add_shape_candidate(
+        candidates,
+        evenly_spaced_shape(
+            target_count, target_center, target_count - 1,
+            target_columns
+        ),
+        target_columns
+    );
+
+    std::vector<std::int64_t> projected;
+    for (const auto source : source_shape) {
+        projected.push_back(std::clamp<std::int64_t>(
+            static_cast<std::int64_t>(std::llround(
+                static_cast<long double>(source)
+                * static_cast<long double>(target_scale)
+                / static_cast<long double>(source_scale)
+            )),
+            0, target_columns - 1
+        ));
+    }
+    if (target_count <= static_cast<std::int64_t>(projected.size())) {
+        for (std::int64_t start = 0;
+             start + target_count
+                 <= static_cast<std::int64_t>(projected.size());
+             ++start) {
+            add_shape_candidate(
+                candidates,
+                std::vector<std::int64_t>(
+                    projected.begin() + start,
+                    projected.begin() + start + target_count
+                ),
+                target_columns
+            );
+        }
+    } else {
+        auto expanded = projected;
+        const auto evenly = evenly_spaced_shape(
+            target_count, target_center, target_span, target_columns
+        );
+        expanded.insert(expanded.end(), evenly.begin(), evenly.end());
+        add_shape_candidate(candidates, expanded, target_columns);
+    }
+
+    const auto base = candidates;
+    for (const auto& candidate : base) {
+        for (std::int64_t shift = -2; shift <= 2; ++shift) {
+            std::vector<std::int64_t> shifted;
+            shifted.reserve(candidate.size());
+            for (const auto value : candidate) {
+                shifted.push_back(value + shift);
+            }
+            add_shape_candidate(candidates, shifted, target_columns);
+        }
+        std::vector<std::int64_t> mirrored;
+        for (const auto value : candidate) {
+            mirrored.push_back(target_columns - 1 - value);
+        }
+        add_shape_candidate(candidates, mirrored, target_columns);
+    }
+    return candidates;
+}
+
+static long double shape_cost(
+    const std::vector<std::int64_t>& source_shape,
+    const std::vector<std::int64_t>& target_shape,
+    std::int64_t source_columns,
+    std::int64_t target_columns,
+    const std::vector<std::int64_t>* previous_shape
+) {
+    if (target_shape.empty()) {
+        return 1000000000.0L;
+    }
+
+    const auto center = [](const std::vector<std::int64_t>& shape) {
+        long double result = 0;
+        for (const auto value : shape) {
+            result += static_cast<long double>(value);
+        }
+        return result / static_cast<long double>(shape.size());
+    };
+    const auto span = [](const std::vector<std::int64_t>& shape) {
+        return shape.empty()
+            ? 0.0L
+            : static_cast<long double>(shape.back() - shape.front());
+    };
+
+    const auto source_scale = std::max(source_columns - 1, std::int64_t(1));
+    const auto target_scale = std::max(target_columns - 1, std::int64_t(1));
+    const auto center_error = std::abs(
+        center(target_shape) / target_scale
+        - center(source_shape) / source_scale
+    );
+    const auto span_error = std::abs(
+        span(target_shape) / target_scale
+        - span(source_shape) / source_scale
+    );
+
+    long double gap_error = 0;
+    const auto source_gap_count = source_shape.size() > 1
+        ? source_shape.size() - 1
+        : 0;
+    const auto target_gap_count = target_shape.size() > 1
+        ? target_shape.size() - 1
+        : 0;
+    const auto gap_count = std::max(source_gap_count, target_gap_count);
+    for (std::size_t index = 0; index < gap_count; ++index) {
+        const auto gap_at = [](const std::vector<std::int64_t>& shape,
+                               std::size_t count,
+                               std::size_t index) {
+            if (count == 0 || shape.size() < 2) {
+                return 0.0L;
+            }
+            const auto scaled = index * (shape.size() - 1);
+            const auto left = std::min(
+                scaled / count, shape.size() - 2
+            );
+            const auto right = left + 1;
+            return static_cast<long double>(
+                shape[right] - shape[left]
+            );
+        };
+        const auto source_gap = gap_at(
+            source_shape, gap_count, index
+        ) / source_scale;
+        const auto target_gap = gap_at(
+            target_shape, gap_count, index
+        ) / target_scale;
+        gap_error += std::abs(source_gap - target_gap);
+    }
+
+    long double continuity = 0;
+    if (previous_shape && !previous_shape->empty()) {
+        continuity = std::abs(
+            center(target_shape) - center(*previous_shape)
+        ) / target_scale;
+    }
+    return 4.0L * center_error
+        + 3.0L * span_error
+        + 2.0L * gap_error
+        + 0.5L * continuity;
+}
+
+static bool shape_is_available(
+    const std::vector<std::int64_t>& shape,
+    const std::vector<bool>& locked_targets
+) {
+    return std::all_of(
+        shape.begin(), shape.end(),
+        [&](std::int64_t target) {
+            return !locked_targets[static_cast<std::size_t>(target)];
+        }
+    );
+}
+
+static std::vector<std::int64_t> source_shape_for_event(
+    const std::vector<json>& ordinary_notes,
+    const ShapeEvent& event
+) {
+    std::vector<std::int64_t> shape;
+    for (const auto index : event.indexes) {
+        const auto source = ordinary_notes[index]["column"].get<std::int64_t>();
+        shape.push_back(source);
+    }
+    std::sort(shape.begin(), shape.end());
+    shape.erase(std::unique(shape.begin(), shape.end()), shape.end());
+    return shape;
+}
+
+static std::vector<std::size_t> select_event_notes(
+    const std::vector<json>& ordinary_notes,
+    const ShapeEvent& event,
+    std::int64_t target_count
+) {
+    std::vector<std::size_t> holds;
+    std::vector<std::size_t> ordinary;
+    for (const auto index : event.indexes) {
+        if (is_hold_note(ordinary_notes[index])) {
+            holds.push_back(index);
+        } else {
+            ordinary.push_back(index);
+        }
+    }
+
+    target_count = std::max<std::int64_t>(
+        target_count, static_cast<std::int64_t>(holds.size())
+    );
+    std::vector<std::size_t> selected = holds;
+    if (target_count <= static_cast<std::int64_t>(selected.size())) {
+        return selected;
+    }
+
+    const auto remaining = target_count
+        - static_cast<std::int64_t>(selected.size());
+    if (remaining >= static_cast<std::int64_t>(ordinary.size())) {
+        selected.insert(selected.end(), ordinary.begin(), ordinary.end());
+        return selected;
+    }
+
+    for (std::int64_t index = 0; index < remaining; ++index) {
+        const auto position = static_cast<std::size_t>(
+            (index * ordinary.size()) / remaining
+        );
+        selected.push_back(ordinary[position]);
+    }
+    return selected;
+}
+
+static std::vector<std::int64_t> choose_event_shape(
+    const std::vector<std::int64_t>& source_shape,
+    std::int64_t target_count,
+    std::int64_t source_columns,
+    std::int64_t target_columns,
+    const std::vector<bool>& locked_targets,
+    const std::vector<std::int64_t>* previous_shape
+) {
+    auto candidates = build_shape_candidates(
+        source_shape, target_count, source_columns, target_columns
+    );
+    std::vector<std::int64_t> best;
+    long double best_cost = 0;
+    for (const auto& candidate : candidates) {
+        if (!shape_is_available(candidate, locked_targets)) {
+            continue;
+        }
+        const auto cost = shape_cost(
+            source_shape, candidate, source_columns, target_columns,
+            previous_shape
+        );
+        if (best.empty() || cost < best_cost
+            || (cost == best_cost && candidate < best)) {
+            best = candidate;
+            best_cost = cost;
+        }
+    }
+
+    if (!best.empty()) {
+        return best;
+    }
+
+    for (const auto& candidate : candidates) {
+        const auto available = std::count_if(
+            candidate.begin(), candidate.end(),
+            [&](std::int64_t target) {
+                return !locked_targets[static_cast<std::size_t>(target)];
+            }
+        );
+        if (available <= 0) {
+            continue;
+        }
+        if (best.empty() || available > static_cast<std::int64_t>(best.size())
+            || (available == static_cast<std::int64_t>(best.size())
+                && candidate < best)) {
+            best = candidate;
+            best.erase(
+                std::remove_if(
+                    best.begin(), best.end(),
+                    [&](std::int64_t target) {
+                        return locked_targets[
+                            static_cast<std::size_t>(target)
+                        ];
+                    }
+                ),
+                best.end()
+            );
+        }
+    }
+    return best;
+}
+
+static std::int64_t closest_target_index(
+    const std::vector<std::int64_t>& source_shape,
+    std::int64_t source,
+    std::int64_t target_count,
+    std::int64_t source_columns
+) {
+    if (source_shape.empty() || target_count <= 1) {
+        return 0;
+    }
+    const auto source_it = std::lower_bound(
+        source_shape.begin(), source_shape.end(), source
+    );
+    const auto source_index = static_cast<std::int64_t>(
+        std::distance(source_shape.begin(), source_it)
+    );
+    return std::clamp<std::int64_t>(
+        source_index * target_count / source_shape.size(),
+        0, target_count - 1
+    );
+}
+
+static void process_shape_path(
+    std::vector<json>& ordinary_notes,
+    const std::vector<std::optional<std::int64_t>>& source_ranks,
+    const Rational& lambda,
+    std::int64_t source_columns,
+    std::int64_t target_columns,
+    const Rational& minimum_input_gap,
+    std::vector<bool>& keep
+) {
+    const auto events = build_shape_events(
+        ordinary_notes, source_ranks, minimum_input_gap
+    );
+    const auto minimum_target_gap =
+        minimum_input_gap * target_columns / source_columns;
+    std::vector<bool> locked_targets(
+        static_cast<std::size_t>(target_columns), false
+    );
+    std::vector<std::optional<Rational>> last_end(
+        static_cast<std::size_t>(target_columns)
+    );
+    std::vector<HoldInfo> active_holds;
+    std::vector<std::int64_t> target_shape_previous;
+    std::int64_t event_number = 0;
+
+    for (const auto& event : events) {
+        const auto start = event.start;
+        for (std::size_t index = 0; index < active_holds.size();) {
+            if (!(active_holds[index].end <= start)) {
+                ++index;
+                continue;
+            }
+            locked_targets[
+                static_cast<std::size_t>(active_holds[index].target)
+            ] = false;
+            active_holds.erase(
+                active_holds.begin()
+                + static_cast<std::ptrdiff_t>(index)
+            );
+        }
+
+        const auto source_shape = source_shape_for_event(
+            ordinary_notes, event
+        );
+        auto target_count = balanced_shape_count(
+            static_cast<std::int64_t>(source_shape.size()),
+            lambda, source_columns, target_columns, event_number
+        );
+        ++event_number;
+
+        for (const auto index : event.indexes) {
+            if (is_hold_note(ordinary_notes[index])) {
+                ++target_count;
+            }
+        }
+        target_count = std::clamp<std::int64_t>(
+            target_count, 1, target_columns
+        );
+
+        auto shape_locked_targets = locked_targets;
+        for (std::int64_t target = 0; target < target_columns; ++target) {
+            if (last_end[static_cast<std::size_t>(target)]
+                && start - *last_end[
+                    static_cast<std::size_t>(target)
+                ] < minimum_target_gap) {
+                shape_locked_targets[static_cast<std::size_t>(target)] = true;
+            }
+        }
+        auto target_shape = choose_event_shape(
+            source_shape, target_count, source_columns, target_columns,
+            shape_locked_targets,
+            target_shape_previous.empty() ? nullptr : &target_shape_previous
+        );
+        if (target_shape.empty()) {
+            continue;
+        }
+
+        const auto selected = select_event_notes(
+            ordinary_notes, event,
+            static_cast<std::int64_t>(target_shape.size())
+        );
+        for (const auto index : event.indexes) {
+            keep[index] = false;
+        }
+        std::set<std::int64_t> used_targets;
+        std::vector<std::size_t> selected_for_output;
+        for (const auto index : selected) {
+            const auto source = ordinary_notes[index]["column"]
+                .get<std::int64_t>();
+            auto target_index = closest_target_index(
+                source_shape, source,
+                static_cast<std::int64_t>(target_shape.size()),
+                source_columns
+            );
+            while (target_index
+                   < static_cast<std::int64_t>(target_shape.size())
+                   && used_targets.count(
+                       target_shape[static_cast<std::size_t>(target_index)]
+                   )) {
+                ++target_index;
+            }
+            if (target_index
+                >= static_cast<std::int64_t>(target_shape.size())) {
+                target_index = 0;
+                while (used_targets.count(
+                           target_shape[static_cast<std::size_t>(target_index)]
+                       )) {
+                    ++target_index;
+                    if (target_index
+                        >= static_cast<std::int64_t>(target_shape.size())) {
+                        break;
+                    }
+                }
+            }
+            if (target_index
+                >= static_cast<std::int64_t>(target_shape.size())) {
+                keep[index] = false;
+                continue;
+            }
+
+            const auto target = target_shape[
+                static_cast<std::size_t>(target_index)
+            ];
+            if (last_end[static_cast<std::size_t>(target)]
+                && start - *last_end[
+                    static_cast<std::size_t>(target)
+                ] < minimum_target_gap) {
+                keep[index] = false;
+                continue;
+            }
+            ordinary_notes[index]["column"] = target;
+            keep[index] = true;
+            used_targets.insert(target);
+            selected_for_output.push_back(index);
+            if (is_hold_note(ordinary_notes[index])) {
+                const auto end = *endbeat_value(ordinary_notes[index]);
+                locked_targets[static_cast<std::size_t>(target)] = true;
+                active_holds.push_back({
+                    index, source, target, start, end
+                });
+                last_end[static_cast<std::size_t>(target)] = end;
+            } else {
+                last_end[static_cast<std::size_t>(target)] = start;
+            }
+        }
+
+        for (const auto target : target_shape) {
+            if (used_targets.count(target)) {
+                continue;
+            }
+            if (selected.empty()) {
+                break;
+            }
+            const auto template_index = selected.front();
+            auto clone = ordinary_notes[template_index];
+            clone["column"] = target;
+            clone.erase("endbeat");
+            const auto clone_beat = beat_value(clone);
+            if (!clone_beat
+                || (last_end[static_cast<std::size_t>(target)]
+                    && *clone_beat - *last_end[
+                        static_cast<std::size_t>(target)
+                    ] < minimum_target_gap)) {
+                continue;
+            }
+            ordinary_notes.push_back(std::move(clone));
+            keep.push_back(true);
+            last_end[static_cast<std::size_t>(target)] = *clone_beat;
+        }
+        target_shape_previous = target_shape;
+    }
+}
+
+static std::int64_t repair_shape_spacing(
+    std::vector<json>& ordinary_notes,
+    std::vector<bool>& keep,
+    std::int64_t target_columns,
+    const Rational& minimum_target_gap
+) {
+    std::vector<std::size_t> indexes;
+    for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
+        if (keep[index] && beat_value(ordinary_notes[index])) {
+            indexes.push_back(index);
+        }
+    }
+    std::sort(
+        indexes.begin(), indexes.end(),
+        [&](std::size_t left, std::size_t right) {
+            const auto left_beat = *beat_value(ordinary_notes[left]);
+            const auto right_beat = *beat_value(ordinary_notes[right]);
+            return left_beat == right_beat
+                ? left < right
+                : left_beat < right_beat;
+        }
+    );
+
+    std::vector<std::optional<Rational>> last_end(
+        static_cast<std::size_t>(target_columns)
+    );
+    std::vector<bool> locked(
+        static_cast<std::size_t>(target_columns), false
+    );
+    std::vector<bool> used_this_beat(
+        static_cast<std::size_t>(target_columns), false
+    );
+    std::optional<Rational> current_beat;
+    std::vector<HoldInfo> active_holds;
+    std::int64_t changed = 0;
+
+    for (const auto index : indexes) {
+        const auto beat = *beat_value(ordinary_notes[index]);
+        if (!current_beat || !(*current_beat == beat)) {
+            current_beat = beat;
+            std::fill(used_this_beat.begin(), used_this_beat.end(), false);
+        }
+
+        for (std::size_t hold_index = 0;
+             hold_index < active_holds.size();) {
+            if (!(active_holds[hold_index].end <= beat)) {
+                ++hold_index;
+                continue;
+            }
+            locked[static_cast<std::size_t>(
+                active_holds[hold_index].target
+            )] = false;
+            active_holds.erase(
+                active_holds.begin()
+                + static_cast<std::ptrdiff_t>(hold_index)
+            );
+        }
+
+        const auto current_target =
+            ordinary_notes[index]["column"].get<std::int64_t>();
+        const auto hold = is_hold_note(ordinary_notes[index]);
+        auto safe = [&](std::int64_t target) {
+            if (used_this_beat[static_cast<std::size_t>(target)]
+                || locked[static_cast<std::size_t>(target)]) {
+                return false;
+            }
+            return !last_end[static_cast<std::size_t>(target)]
+                || !(
+                    beat - *last_end[
+                        static_cast<std::size_t>(target)
+                    ] < minimum_target_gap
+                );
+        };
+
+        std::vector<std::int64_t> candidates;
+        for (std::int64_t target = 0; target < target_columns; ++target) {
+            candidates.push_back(target);
+        }
+        std::sort(
+            candidates.begin(), candidates.end(),
+            [current_target](std::int64_t left, std::int64_t right) {
+                const auto left_distance =
+                    std::llabs(left - current_target);
+                const auto right_distance =
+                    std::llabs(right - current_target);
+                if (left_distance != right_distance) {
+                    return left_distance < right_distance;
+                }
+                return left < right;
+            }
+        );
+
+        std::optional<std::int64_t> selected;
+        for (const auto target : candidates) {
+            if (safe(target)) {
+                selected = target;
+                break;
+            }
+        }
+
+        if (!selected) {
+            std::optional<Rational> best_gap;
+            for (const auto target : candidates) {
+                if (used_this_beat[static_cast<std::size_t>(target)]
+                    || locked[static_cast<std::size_t>(target)]) {
+                    continue;
+                }
+                const auto gap = last_end[static_cast<std::size_t>(target)]
+                    ? beat - *last_end[
+                        static_cast<std::size_t>(target)
+                    ]
+                    : Rational(1LL << 60, 1);
+                if (!best_gap || *best_gap < gap) {
+                    best_gap = gap;
+                    selected = target;
+                }
+            }
+        }
+
+        if (!selected) {
+            keep[index] = false;
+            continue;
+        }
+        if (*selected != current_target) {
+            ordinary_notes[index]["column"] = *selected;
+            ++changed;
+        }
+        used_this_beat[static_cast<std::size_t>(*selected)] = true;
+
+        if (hold) {
+            const auto end = *endbeat_value(ordinary_notes[index]);
+            locked[static_cast<std::size_t>(*selected)] = true;
+            active_holds.push_back({
+                index, 0, *selected, beat, end
+            });
+            last_end[static_cast<std::size_t>(*selected)] = end;
+        } else {
+            last_end[static_cast<std::size_t>(*selected)] = beat;
+        }
+    }
+    return changed;
+}
+
 static void process_mc(
     const std::filesystem::path& input_path,
     std::int64_t target_columns,
+    const Rational& lambda,
     std::optional<std::int64_t> source_columns_override
 ) {
     std::ifstream input(input_path, std::ios::binary);
@@ -1687,10 +2575,6 @@ static void process_mc(
         );
     }
 
-    std::vector<std::int64_t> source_by_index(ordinary_notes.size(), 0);
-    std::vector<std::optional<std::int64_t>> initial_targets(
-        ordinary_notes.size()
-    );
     std::vector<bool> keep(ordinary_notes.size(), true);
     std::int64_t invalid_columns = 0;
     const bool has_holds = std::any_of(
@@ -1705,7 +2589,23 @@ static void process_mc(
     std::int64_t dropped_locked_notes = 0;
     std::int64_t repaired = 0;
     std::int64_t unresolved = 0;
-    for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
+    if (Rational(0, 1) < lambda) {
+        process_shape_path(
+            ordinary_notes, source_ranks, lambda,
+            source_columns, target_columns, minimum_input_gap, keep
+        );
+        repaired = repair_shape_spacing(
+            ordinary_notes, keep, target_columns,
+            minimum_input_gap * target_columns / source_columns
+        );
+    } else {
+        std::vector<std::int64_t> source_by_index(
+            ordinary_notes.size(), 0
+        );
+        std::vector<std::optional<std::int64_t>> initial_targets(
+            ordinary_notes.size()
+        );
+        for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
         if (!ordinary_notes[index].is_object()
             || !ordinary_notes[index].contains("column")
             || !is_valid_column(ordinary_notes[index]["column"], source_columns)) {
@@ -1733,29 +2633,32 @@ static void process_mc(
             (phase + offsets[static_cast<std::size_t>(source)]) % period
         )];
         initial_targets[index] = target;
-    }
-
-    if (has_holds) {
-        const auto dropped = process_holds_stable(
-            ordinary_notes, source_ranks, source_by_index,
-            source_columns, target_columns, minimum_input_gap, keep
-        );
-        trimmed_holds = dropped.trimmed_holds;
-        dropped_holds = dropped.dropped_holds;
-        dropped_locked_notes = dropped.dropped_locked_notes;
-    } else {
-        for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
-            if (!initial_targets[index]) {
-                continue;
-            }
-            ordinary_notes[index]["column"] = *initial_targets[index];
         }
-        const auto repair = repair_short_target_gaps(
-            ordinary_notes, source_by_index, initial_targets, matrix,
-            source_columns, target_columns, minimum_input_gap
-        );
-        repaired = repair.first;
-        unresolved = repair.second;
+
+        if (has_holds) {
+            const auto dropped = process_holds_stable(
+                ordinary_notes, source_ranks, source_by_index,
+                source_columns, target_columns, minimum_input_gap, keep
+            );
+            trimmed_holds = dropped.trimmed_holds;
+            dropped_holds = dropped.dropped_holds;
+            dropped_locked_notes = dropped.dropped_locked_notes;
+        } else {
+            for (std::size_t index = 0;
+                 index < ordinary_notes.size();
+                 ++index) {
+                if (!initial_targets[index]) {
+                    continue;
+                }
+                ordinary_notes[index]["column"] = *initial_targets[index];
+            }
+            const auto repair = repair_short_target_gaps(
+                ordinary_notes, source_by_index, initial_targets, matrix,
+                source_columns, target_columns, minimum_input_gap
+            );
+            repaired = repair.first;
+            unresolved = repair.second;
+        }
     }
 
     std::vector<std::pair<Rational, std::int64_t>> mapped_locations;
@@ -1837,6 +2740,7 @@ static void process_mc(
     std::cout << "Processed " << source_columns << "K -> "
               << target_columns << "K; period=" << period
               << "; version=" << PRONTOM_VERSION
+              << "; lambda=" << rational_to_string(lambda)
               << "; output: " << output_text << '\n';
     if (invalid_columns) {
         std::cout << "Warning: skipped " << invalid_columns
@@ -1911,7 +2815,7 @@ static int run(int argc, const char* const* argv) {
     if (argc < 2) {
         std::cout << "Usage: prontom.exe input.mc\n"
                      "Optional non-interactive form: prontom.exe "
-                     "input.mc target_columns [source_columns]\n";
+                     "input.mc target_columns [lambda] [source_columns]\n";
         return 1;
     }
 
@@ -1924,13 +2828,18 @@ static int run(int argc, const char* const* argv) {
 
     try {
         std::string target_text;
+        Rational lambda(0, 1);
         std::optional<std::int64_t> source_columns;
         if (argc == 3) {
             target_text = argv[2];
         } else if (argc == 4) {
             target_text = argv[2];
+            lambda = parse_lambda(argv[3]);
+        } else if (argc == 5) {
+            target_text = argv[2];
+            lambda = parse_lambda(argv[3]);
             source_columns = parse_positive_integer(
-                argv[3], "Source lane count must be an integer"
+                argv[4], "Source lane count must be an integer"
             );
         } else if (argc == 2) {
             if (!std::getline(std::cin, target_text)) {
@@ -1942,13 +2851,13 @@ static int run(int argc, const char* const* argv) {
         } else {
             std::cout << "Usage: prontom.exe input.mc\n"
                          "Optional non-interactive form: prontom.exe "
-                         "input.mc target_columns [source_columns]\n";
+                         "input.mc target_columns [lambda] [source_columns]\n";
             return 1;
         }
         const auto target_columns = parse_positive_integer(
             target_text, "Target lane count must be an integer"
         );
-        process_mc(input_path, target_columns, source_columns);
+        process_mc(input_path, target_columns, lambda, source_columns);
         return 0;
     } catch (const std::exception& error) {
         std::cout << "Error: " << error.what() << '\n';
