@@ -21,7 +21,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.0.0";
+static constexpr const char* PRONTOM_VERSION = "2.0.1";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -409,6 +409,118 @@ struct SegmentMapper {
             )
         ];
         ++occurrences[source_index];
+        return target_lanes[static_cast<std::size_t>(target_index)];
+    }
+
+    std::optional<std::int64_t> map_unique(
+        std::int64_t source,
+        const std::vector<bool>& used_targets
+    ) {
+        const auto source_it = std::find(source_lanes.begin(),
+                                         source_lanes.end(), source);
+        if (source_it == source_lanes.end() || period == 0) {
+            return std::nullopt;
+        }
+
+        const auto source_index = static_cast<std::size_t>(
+            std::distance(source_lanes.begin(), source_it)
+        );
+        const auto phase = occurrences[source_index] % period;
+        const auto target_index = cycles[source_index][
+            static_cast<std::size_t>(
+                (phase + offsets[source_index]) % period
+            )
+        ];
+        const auto preferred = target_lanes[
+            static_cast<std::size_t>(target_index)
+        ];
+
+        std::optional<std::int64_t> selected;
+        for (const auto target : target_lanes) {
+            if (used_targets[static_cast<std::size_t>(target)]) {
+                continue;
+            }
+            if (!selected
+                || std::llabs(target - preferred)
+                    < std::llabs(*selected - preferred)
+                || (std::llabs(target - preferred)
+                        == std::llabs(*selected - preferred)
+                    && target < *selected)) {
+                selected = target;
+            }
+        }
+        ++occurrences[source_index];
+        return selected;
+    }
+
+    std::optional<std::int64_t> map_unique(
+        std::int64_t source,
+        const std::vector<bool>& used_targets,
+        std::vector<std::int64_t>& source_counts
+    ) const {
+        const auto source_it = std::find(source_lanes.begin(),
+                                         source_lanes.end(), source);
+        if (source_it == source_lanes.end() || period == 0) {
+            return std::nullopt;
+        }
+
+        const auto phase = source_counts[
+            static_cast<std::size_t>(source)
+        ] % period;
+        const auto source_index = static_cast<std::size_t>(
+            std::distance(source_lanes.begin(), source_it)
+        );
+        const auto target_index = cycles[source_index][
+            static_cast<std::size_t>(
+                (phase + offsets[source_index]) % period
+            )
+        ];
+        const auto preferred = target_lanes[
+            static_cast<std::size_t>(target_index)
+        ];
+
+        std::optional<std::int64_t> selected;
+        for (const auto target : target_lanes) {
+            if (used_targets[static_cast<std::size_t>(target)]) {
+                continue;
+            }
+            if (!selected
+                || std::llabs(target - preferred)
+                    < std::llabs(*selected - preferred)
+                || (std::llabs(target - preferred)
+                        == std::llabs(*selected - preferred)
+                    && target < *selected)) {
+                selected = target;
+            }
+        }
+        if (selected) {
+            ++source_counts[static_cast<std::size_t>(source)];
+        }
+        return selected;
+    }
+
+    std::optional<std::int64_t> next_preferred(
+        std::int64_t source,
+        std::vector<std::int64_t>& source_counts
+    ) const {
+        const auto source_it = std::find(source_lanes.begin(),
+                                         source_lanes.end(), source);
+        if (source_it == source_lanes.end() || period == 0) {
+            return std::nullopt;
+        }
+
+        const auto source_index = static_cast<std::size_t>(
+            std::distance(source_lanes.begin(), source_it)
+        );
+        const auto phase = source_counts[
+            static_cast<std::size_t>(source)
+        ] % period;
+        const auto target_index = cycles[source_index][
+            static_cast<std::size_t>(
+                (phase + offsets[source_index]) % period
+            )
+        ];
+        ++source_counts[static_cast<std::size_t>(source)];
         return target_lanes[static_cast<std::size_t>(target_index)];
     }
 };
@@ -849,6 +961,283 @@ static HoldProcessStats process_holds(
         }
 
         cursor = group_end;
+    }
+
+    return stats;
+}
+
+static HoldProcessStats process_holds_stable(
+    std::vector<json>& ordinary_notes,
+    const std::vector<std::optional<std::int64_t>>& source_ranks,
+    const std::vector<std::int64_t>& source_by_index,
+    std::int64_t source_columns,
+    std::int64_t target_columns,
+    const Rational& minimum_input_gap,
+    std::vector<bool>& keep
+) {
+    std::vector<std::size_t> chronological_indexes;
+    for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
+        if (source_ranks[index] && beat_value(ordinary_notes[index])) {
+            chronological_indexes.push_back(index);
+        }
+    }
+    std::sort(
+        chronological_indexes.begin(), chronological_indexes.end(),
+        [&](std::size_t left, std::size_t right) {
+            const auto left_beat = *beat_value(ordinary_notes[left]);
+            const auto right_beat = *beat_value(ordinary_notes[right]);
+            if (left_beat == right_beat) {
+                return left < right;
+            }
+            return left_beat < right_beat;
+        }
+    );
+
+    std::vector<HoldInfo> active_holds;
+    std::vector<bool> active_sources(
+        static_cast<std::size_t>(source_columns), false
+    );
+    std::vector<bool> active_targets(
+        static_cast<std::size_t>(target_columns), false
+    );
+    std::optional<SegmentMapper> mapper;
+    bool mapper_dirty = true;
+    std::optional<Rational> current_beat_group;
+    std::vector<bool> used_targets_this_beat(
+        static_cast<std::size_t>(target_columns), false
+    );
+    std::vector<std::int64_t> source_counts(
+        static_cast<std::size_t>(source_columns), 0
+    );
+    std::vector<std::optional<Rational>> last_end(
+        static_cast<std::size_t>(target_columns)
+    );
+    const auto minimum_target_gap =
+        minimum_input_gap * target_columns / source_columns;
+    HoldProcessStats stats;
+
+    auto rebuild_mapper = [&]() {
+        std::vector<std::int64_t> free_sources;
+        std::vector<std::int64_t> free_targets;
+        for (std::int64_t source = 0; source < source_columns; ++source) {
+            if (!active_sources[static_cast<std::size_t>(source)]) {
+                free_sources.push_back(source);
+            }
+        }
+        for (std::int64_t target = 0; target < target_columns; ++target) {
+            if (!active_targets[static_cast<std::size_t>(target)]) {
+                free_targets.push_back(target);
+            }
+        }
+        mapper.emplace(free_sources, free_targets);
+        mapper_dirty = false;
+    };
+
+    auto expire_holds = [&](const Rational& beat) {
+        for (std::size_t index = 0; index < active_holds.size();) {
+            if (!(active_holds[index].end <= beat)) {
+                ++index;
+                continue;
+            }
+            active_sources[static_cast<std::size_t>(
+                active_holds[index].source
+            )] = false;
+            active_targets[static_cast<std::size_t>(
+                active_holds[index].target
+            )] = false;
+            active_holds.erase(
+                active_holds.begin()
+                + static_cast<std::ptrdiff_t>(index)
+            );
+            mapper_dirty = true;
+        }
+    };
+
+    auto trim_source_conflict = [&](std::int64_t source,
+                                    const Rational& beat) {
+        for (std::size_t index = 0; index < active_holds.size(); ++index) {
+            if (active_holds[index].source != source) {
+                continue;
+            }
+            const auto target = active_holds[index].target;
+            const auto hold_index = active_holds[index].note_index;
+            const auto same_start = active_holds[index].start == beat;
+            trim_hold_before(
+                ordinary_notes, active_holds, active_sources,
+                active_targets, index, beat
+            );
+            const auto trimmed_end = endbeat_value(ordinary_notes[hold_index]);
+            last_end[static_cast<std::size_t>(target)] =
+                trimmed_end.value_or(beat);
+            if (!same_start) {
+                used_targets_this_beat[static_cast<std::size_t>(target)] =
+                    false;
+            }
+            ++stats.trimmed_holds;
+            mapper_dirty = true;
+            return;
+        }
+    };
+
+    for (const auto index : chronological_indexes) {
+        const auto beat = *beat_value(ordinary_notes[index]);
+        if (!current_beat_group || !(*current_beat_group == beat)) {
+            current_beat_group = beat;
+            std::fill(used_targets_this_beat.begin(),
+                      used_targets_this_beat.end(), false);
+        }
+        expire_holds(beat);
+
+        const auto source = source_by_index[index];
+        const bool hold = is_hold_note(ordinary_notes[index]);
+        if (hold && active_sources[static_cast<std::size_t>(source)]) {
+            trim_source_conflict(source, beat);
+        }
+        if (mapper_dirty) {
+            rebuild_mapper();
+        }
+
+        if (active_sources[static_cast<std::size_t>(source)]) {
+            keep[index] = false;
+            if (hold) {
+                ++stats.dropped_holds;
+            } else {
+                ++stats.dropped_locked_notes;
+            }
+            continue;
+        }
+
+        const auto preferred = mapper->next_preferred(
+            source, source_counts
+        );
+        if (!preferred) {
+            keep[index] = false;
+            if (hold) {
+                ++stats.dropped_holds;
+            } else {
+                ++stats.dropped_locked_notes;
+            }
+            continue;
+        }
+
+        auto choose_target = [&](std::int64_t preferred_target)
+            -> std::optional<std::int64_t> {
+            std::vector<std::int64_t> candidates;
+            for (const auto target : mapper->target_lanes) {
+                if (!used_targets_this_beat[
+                        static_cast<std::size_t>(target)
+                    ]) {
+                    candidates.push_back(target);
+                }
+            }
+            std::sort(
+                candidates.begin(), candidates.end(),
+                [preferred_target](std::int64_t left, std::int64_t right) {
+                    const auto left_distance =
+                        std::llabs(left - preferred_target);
+                    const auto right_distance =
+                        std::llabs(right - preferred_target);
+                    if (left_distance != right_distance) {
+                        return left_distance < right_distance;
+                    }
+                    return left < right;
+                }
+            );
+
+            for (const auto target : candidates) {
+                if (!last_end[static_cast<std::size_t>(target)]
+                    || !(
+                        beat - *last_end[
+                            static_cast<std::size_t>(target)
+                        ] < minimum_target_gap
+                    )) {
+                    return target;
+                }
+            }
+
+            std::optional<std::int64_t> best_target;
+            std::optional<Rational> best_gap;
+            for (const auto target : candidates) {
+                if (!last_end[static_cast<std::size_t>(target)]) {
+                    return target;
+                }
+                const auto gap = beat - *last_end[
+                    static_cast<std::size_t>(target)
+                ];
+                if (!best_target || *best_gap < gap) {
+                    best_target = target;
+                    best_gap = gap;
+                }
+            }
+            return best_target;
+        };
+
+        auto target = choose_target(*preferred);
+        if (hold && (
+                !target
+                || (
+                    last_end[static_cast<std::size_t>(*target)]
+                    && beat - *last_end[
+                        static_cast<std::size_t>(*target)
+                    ] < minimum_target_gap
+                )
+            )) {
+            while (!active_holds.empty()
+                   && (
+                       !target
+                       || (
+                           last_end[static_cast<std::size_t>(*target)]
+                           && beat - *last_end[
+                               static_cast<std::size_t>(*target)
+                           ] < minimum_target_gap
+                       )
+                   )) {
+                const auto released_target = active_holds.front().target;
+                const auto hold_index = active_holds.front().note_index;
+                const auto same_start =
+                    active_holds.front().start == beat;
+                trim_hold_before(
+                    ordinary_notes, active_holds, active_sources,
+                    active_targets, 0, beat
+                );
+                last_end[static_cast<std::size_t>(released_target)] =
+                    endbeat_value(ordinary_notes[hold_index]).value_or(beat);
+                if (!same_start) {
+                    used_targets_this_beat[
+                        static_cast<std::size_t>(released_target)
+                    ] = false;
+                }
+                ++stats.trimmed_holds;
+                mapper_dirty = true;
+                rebuild_mapper();
+                target = choose_target(*preferred);
+            }
+        }
+        if (!target) {
+            keep[index] = false;
+            if (hold) {
+                ++stats.dropped_holds;
+            } else {
+                ++stats.dropped_locked_notes;
+            }
+            continue;
+        }
+
+        ordinary_notes[index]["column"] = *target;
+        used_targets_this_beat[static_cast<std::size_t>(*target)] = true;
+        if (!hold) {
+            last_end[static_cast<std::size_t>(*target)] = beat;
+            continue;
+        }
+
+        const auto end = *endbeat_value(ordinary_notes[index]);
+        last_end[static_cast<std::size_t>(*target)] = end;
+        active_sources[static_cast<std::size_t>(source)] = true;
+        active_targets[static_cast<std::size_t>(*target)] = true;
+        active_holds.push_back({
+            index, source, *target, beat, end
+        });
+        mapper_dirty = true;
     }
 
     return stats;
@@ -1347,20 +1736,13 @@ static void process_mc(
     }
 
     if (has_holds) {
-        const auto dropped = process_holds(
-            ordinary_notes, source_ranks, source_by_index, matrix,
-            cycles, offsets, period, source_columns, target_columns, keep
+        const auto dropped = process_holds_stable(
+            ordinary_notes, source_ranks, source_by_index,
+            source_columns, target_columns, minimum_input_gap, keep
         );
         trimmed_holds = dropped.trimmed_holds;
         dropped_holds = dropped.dropped_holds;
         dropped_locked_notes = dropped.dropped_locked_notes;
-
-        const auto hold_repair = repair_hold_results(
-            ordinary_notes, source_by_index, keep, source_columns,
-            target_columns, minimum_input_gap
-        );
-        repaired = hold_repair.first;
-        dropped_locked_notes += hold_repair.second;
     } else {
         for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
             if (!initial_targets[index]) {
