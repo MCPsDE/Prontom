@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.5";
+static constexpr const char* PRONTOM_VERSION = "2.1.6";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -2037,13 +2037,17 @@ static std::vector<std::int64_t> choose_event_shape(
     std::int64_t source_columns,
     std::int64_t target_columns,
     const std::vector<bool>& locked_targets,
+    std::int64_t variant_index,
     const std::vector<std::int64_t>* previous_shape
 ) {
     auto candidates = build_shape_candidates(
         source_shape, target_count, source_columns, target_columns
     );
-    std::vector<std::int64_t> best;
-    long double best_cost = 0;
+    struct ScoredCandidate {
+        std::vector<std::int64_t> shape;
+        long double cost = 0;
+    };
+    std::vector<ScoredCandidate> available;
     for (const auto& candidate : candidates) {
         if (!shape_is_available(candidate, locked_targets)) {
             continue;
@@ -2052,13 +2056,28 @@ static std::vector<std::int64_t> choose_event_shape(
             source_shape, candidate, source_columns, target_columns,
             previous_shape
         );
-        if (best.empty() || cost < best_cost
-            || (cost == best_cost && candidate < best)) {
-            best = candidate;
-            best_cost = cost;
-        }
+        available.push_back({candidate, cost});
     }
 
+    if (!available.empty()) {
+        std::sort(
+            available.begin(), available.end(),
+            [](const ScoredCandidate& left, const ScoredCandidate& right) {
+                if (left.cost != right.cost) {
+                    return left.cost < right.cost;
+                }
+                return left.shape < right.shape;
+            }
+        );
+        const auto candidate_count = std::min<std::size_t>(
+            available.size(), 8
+        );
+        return available[
+            static_cast<std::size_t>(variant_index % candidate_count)
+        ].shape;
+    }
+
+    std::vector<std::int64_t> best;
     if (!best.empty()) {
         return best;
     }
@@ -2136,6 +2155,7 @@ static void process_shape_path(
     );
     std::vector<HoldInfo> active_holds;
     std::vector<std::int64_t> target_shape_previous;
+    std::map<std::string, std::int64_t> shape_occurrences;
     std::int64_t event_number = 0;
 
     for (const auto& event : events) {
@@ -2157,6 +2177,8 @@ static void process_shape_path(
         const auto source_shape = source_shape_for_event(
             ordinary_notes, event
         );
+        const auto shape_key = shape_signature(source_shape);
+        const auto variant_index = shape_occurrences[shape_key]++;
         auto target_count = balanced_shape_count(
             static_cast<std::int64_t>(source_shape.size()),
             lambda, source_columns, target_columns, event_number
@@ -2184,6 +2206,7 @@ static void process_shape_path(
         auto target_shape = choose_event_shape(
             source_shape, target_count, source_columns, target_columns,
             shape_locked_targets,
+            variant_index,
             target_shape_previous.empty() ? nullptr : &target_shape_previous
         );
         if (target_shape.empty()) {
@@ -2197,6 +2220,25 @@ static void process_shape_path(
         for (const auto index : event.indexes) {
             keep[index] = false;
         }
+        std::vector<std::size_t> source_holds;
+        std::optional<json> hold_endbeat_template;
+        std::optional<Rational> hold_end_template_value;
+        for (const auto index : event.indexes) {
+            if (!is_hold_note(ordinary_notes[index])) {
+                continue;
+            }
+            source_holds.push_back(index);
+            const auto& endbeat = ordinary_notes[index]["endbeat"];
+            const auto end_value = beat_value(json{{"beat", endbeat}});
+            if (end_value
+                && (!hold_end_template_value
+                    || *hold_end_template_value < *end_value)) {
+                hold_endbeat_template = endbeat;
+                hold_end_template_value = end_value;
+            }
+        }
+        const bool extend_added_holds =
+            !source_holds.empty() && event.indexes.size() > 1;
         std::set<std::int64_t> used_targets;
         std::vector<std::size_t> selected_for_output;
         for (const auto index : selected) {
@@ -2269,7 +2311,11 @@ static void process_shape_path(
             const auto template_index = selected.front();
             auto clone = ordinary_notes[template_index];
             clone["column"] = target;
-            clone.erase("endbeat");
+            if (extend_added_holds && hold_endbeat_template) {
+                clone["endbeat"] = *hold_endbeat_template;
+            } else {
+                clone.erase("endbeat");
+            }
             const auto clone_beat = beat_value(clone);
             if (!clone_beat
                 || (last_end[static_cast<std::size_t>(target)]
@@ -2280,7 +2326,17 @@ static void process_shape_path(
             }
             ordinary_notes.push_back(std::move(clone));
             keep.push_back(true);
-            last_end[static_cast<std::size_t>(target)] = *clone_beat;
+            const auto clone_index = ordinary_notes.size() - 1;
+            if (extend_added_holds && hold_endbeat_template) {
+                const auto end = *endbeat_value(ordinary_notes[clone_index]);
+                locked_targets[static_cast<std::size_t>(target)] = true;
+                active_holds.push_back({
+                    clone_index, 0, target, *clone_beat, end
+                });
+                last_end[static_cast<std::size_t>(target)] = end;
+            } else {
+                last_end[static_cast<std::size_t>(target)] = *clone_beat;
+            }
         }
         target_shape_previous = target_shape;
     }
