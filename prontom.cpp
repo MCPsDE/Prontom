@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.4";
+static constexpr const char* PRONTOM_VERSION = "2.1.5";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -1338,7 +1338,7 @@ static std::pair<std::int64_t, std::int64_t> repair_short_target_gaps(
         static_cast<std::size_t>(target_columns), false
     );
     const auto minimum_target_gap =
-        minimum_input_gap * target_columns / source_columns;
+        minimum_input_gap;
     std::int64_t changed = 0;
     std::int64_t unresolved = 0;
 
@@ -2127,7 +2127,7 @@ static void process_shape_path(
         ordinary_notes, source_ranks, minimum_input_gap
     );
     const auto minimum_target_gap =
-        minimum_input_gap * target_columns / source_columns;
+        minimum_input_gap;
     std::vector<bool> locked_targets(
         static_cast<std::size_t>(target_columns), false
     );
@@ -2566,7 +2566,7 @@ static void process_mc(
         );
         repaired = repair_shape_spacing(
             ordinary_notes, keep, target_columns,
-            minimum_input_gap * target_columns / source_columns
+            minimum_input_gap
         );
     } else {
         std::vector<std::int64_t> source_by_index(
