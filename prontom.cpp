@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.7";
+static constexpr const char* PRONTOM_VERSION = "2.1.8";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -211,54 +211,6 @@ static bool is_valid_column(const json& value, std::int64_t source_columns) {
         && !value.is_boolean()
         && value.get<std::int64_t>() >= 0
         && value.get<std::int64_t>() < source_columns;
-}
-
-static bool canonicalize_source_orientation(
-    std::vector<json>& ordinary_notes,
-    std::int64_t source_columns
-) {
-    std::vector<std::int64_t> original_key;
-    std::vector<std::int64_t> mirrored_key;
-    for (const auto& note : ordinary_notes) {
-        if (!note.is_object() || !note.contains("column")
-            || !is_valid_column(note["column"], source_columns)) {
-            continue;
-        }
-        const auto source = note["column"].get<std::int64_t>();
-        original_key.push_back(source);
-        mirrored_key.push_back(source_columns - 1 - source);
-    }
-
-    if (!std::lexicographical_compare(
-            mirrored_key.begin(), mirrored_key.end(),
-            original_key.begin(), original_key.end()
-        )) {
-        return false;
-    }
-
-    for (auto& note : ordinary_notes) {
-        if (!note.is_object() || !note.contains("column")
-            || !is_valid_column(note["column"], source_columns)) {
-            continue;
-        }
-        const auto source = note["column"].get<std::int64_t>();
-        note["column"] = source_columns - 1 - source;
-    }
-    return true;
-}
-
-static void mirror_target_orientation(
-    std::vector<json>& ordinary_notes,
-    std::int64_t target_columns
-) {
-    for (auto& note : ordinary_notes) {
-        if (!note.is_object() || !note.contains("column")
-            || !is_valid_column(note["column"], target_columns)) {
-            continue;
-        }
-        const auto target = note["column"].get<std::int64_t>();
-        note["column"] = target_columns - 1 - target;
-    }
 }
 
 static std::optional<Rational> beat_value(const json& note) {
@@ -2570,9 +2522,6 @@ static void process_mc(
         throw std::invalid_argument("Target lane count must be positive");
     }
 
-    const auto source_orientation_mirrored =
-        canonicalize_source_orientation(ordinary_notes, source_columns);
-
     std::int64_t period = 0;
     const auto matrix = build_integer_matrix(
         source_columns, target_columns, period
@@ -2738,10 +2687,6 @@ static void process_mc(
         }
     }
 
-    if (source_orientation_mirrored) {
-        mirror_target_orientation(ordinary_notes, target_columns);
-    }
-
     std::vector<std::pair<Rational, std::int64_t>> mapped_locations;
     for (std::size_t note_index = 0;
          note_index < ordinary_notes.size();
@@ -2822,9 +2767,6 @@ static void process_mc(
               << target_columns << "K; period=" << period
               << "; version=" << PRONTOM_VERSION
               << "; lambda=" << rational_to_string(lambda)
-              << (source_orientation_mirrored
-                      ? "; orientation=canonical-mirrored"
-                      : "; orientation=canonical-original")
               << "; output: " << output_text << '\n';
     if (invalid_columns) {
         std::cout << "Warning: skipped " << invalid_columns
