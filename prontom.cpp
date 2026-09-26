@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.1";
+static constexpr const char* PRONTOM_VERSION = "2.1.2";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -148,7 +148,7 @@ static Rational parse_lambda(const std::string& text) {
         return value;
     } catch (const std::exception&) {
         throw std::invalid_argument(
-            "lambda must be a non-negative rational number"
+            "lambda must be a rational number between 0 and 1"
         );
     }
 }
@@ -572,45 +572,6 @@ struct SegmentMapper {
         return selected;
     }
 
-    std::optional<std::int64_t> map_unique_at(
-        std::int64_t source,
-        std::int64_t occurrence,
-        const std::vector<bool>& used_targets
-    ) const {
-        const auto source_it = std::find(source_lanes.begin(),
-                                         source_lanes.end(), source);
-        if (source_it == source_lanes.end() || period == 0) {
-            return std::nullopt;
-        }
-        const auto source_index = static_cast<std::size_t>(
-            std::distance(source_lanes.begin(), source_it)
-        );
-        const auto phase = occurrence % period;
-        const auto target_index = cycles[source_index][
-            static_cast<std::size_t>(
-                (phase + offsets[source_index]) % period
-            )
-        ];
-        const auto preferred = target_lanes[
-            static_cast<std::size_t>(target_index)
-        ];
-        std::optional<std::int64_t> selected;
-        for (const auto target : target_lanes) {
-            if (used_targets[static_cast<std::size_t>(target)]) {
-                continue;
-            }
-            if (!selected
-                || std::llabs(target - preferred)
-                    < std::llabs(*selected - preferred)
-                || (std::llabs(target - preferred)
-                        == std::llabs(*selected - preferred)
-                    && target < *selected)) {
-                selected = target;
-            }
-        }
-        return selected;
-    }
-
     std::optional<std::int64_t> next_preferred(
         std::int64_t source,
         std::vector<std::int64_t>& source_counts
@@ -633,27 +594,6 @@ struct SegmentMapper {
             )
         ];
         ++source_counts[static_cast<std::size_t>(source)];
-        return target_lanes[static_cast<std::size_t>(target_index)];
-    }
-
-    std::optional<std::int64_t> preferred_at(
-        std::int64_t source,
-        std::int64_t occurrence
-    ) const {
-        const auto source_it = std::find(source_lanes.begin(),
-                                         source_lanes.end(), source);
-        if (source_it == source_lanes.end() || period == 0) {
-            return std::nullopt;
-        }
-        const auto source_index = static_cast<std::size_t>(
-            std::distance(source_lanes.begin(), source_it)
-        );
-        const auto phase = occurrence % period;
-        const auto target_index = cycles[source_index][
-            static_cast<std::size_t>(
-                (phase + offsets[source_index]) % period
-            )
-        ];
         return target_lanes[static_cast<std::size_t>(target_index)];
     }
 };
@@ -1139,11 +1079,11 @@ static HoldProcessStats process_holds_stable(
     std::vector<bool> used_targets_this_beat(
         static_cast<std::size_t>(target_columns), false
     );
+    std::vector<std::int64_t> source_counts(
+        static_cast<std::size_t>(source_columns), 0
+    );
     std::vector<std::optional<Rational>> last_end(
         static_cast<std::size_t>(target_columns)
-    );
-    std::vector<std::int64_t> target_loads(
-        static_cast<std::size_t>(target_columns), 0
     );
     const auto minimum_target_gap =
         minimum_input_gap * target_columns / source_columns;
@@ -1212,49 +1152,6 @@ static HoldProcessStats process_holds_stable(
         }
     };
 
-    auto trim_best_capacity_conflict = [&](const Rational& beat) {
-        if (active_holds.empty()) {
-            return false;
-        }
-        std::size_t best_index = 0;
-        for (std::size_t index = 1; index < active_holds.size(); ++index) {
-            const auto& left = active_holds[index];
-            const auto& right = active_holds[best_index];
-            const auto left_load = target_loads[
-                static_cast<std::size_t>(left.target)
-            ];
-            const auto right_load = target_loads[
-                static_cast<std::size_t>(right.target)
-            ];
-            if (left_load != right_load) {
-                if (left_load > right_load) {
-                    best_index = index;
-                }
-                continue;
-            }
-            const auto left_length = left.end - left.start;
-            const auto right_length = right.end - right.start;
-            if (left_length < right_length) {
-                best_index = index;
-                continue;
-            }
-            if (left_length == right_length) {
-                if (right.start < left.start
-                    || (right.start == left.start
-                        && right.note_index < left.note_index)) {
-                    best_index = index;
-                }
-            }
-        }
-        trim_hold_before(
-            ordinary_notes, active_holds, active_sources,
-            active_targets, best_index, beat
-        );
-        ++stats.trimmed_holds;
-        mapper_dirty = true;
-        return true;
-    };
-
     for (const auto index : chronological_indexes) {
         const auto beat = *beat_value(ordinary_notes[index]);
         if (!current_beat_group || !(*current_beat_group == beat)) {
@@ -1283,8 +1180,8 @@ static HoldProcessStats process_holds_stable(
             continue;
         }
 
-        const auto preferred = mapper->preferred_at(
-            source, *source_ranks[index]
+        const auto preferred = mapper->next_preferred(
+            source, source_counts
         );
         if (!preferred) {
             keep[index] = false;
@@ -1300,12 +1197,11 @@ static HoldProcessStats process_holds_stable(
             -> std::optional<std::int64_t> {
             std::vector<std::int64_t> candidates;
             for (const auto target : mapper->target_lanes) {
-                if (used_targets_this_beat[
+                if (!used_targets_this_beat[
                         static_cast<std::size_t>(target)
                     ]) {
-                    continue;
+                    candidates.push_back(target);
                 }
-                candidates.push_back(target);
             }
             std::sort(
                 candidates.begin(), candidates.end(),
@@ -1320,8 +1216,7 @@ static HoldProcessStats process_holds_stable(
                     return left < right;
                 }
             );
-            std::optional<std::int64_t> best;
-            std::optional<Rational> best_gap;
+
             for (const auto target : candidates) {
                 if (!last_end[static_cast<std::size_t>(target)]
                     || !(
@@ -1331,15 +1226,23 @@ static HoldProcessStats process_holds_stable(
                     )) {
                     return target;
                 }
+            }
+
+            std::optional<std::int64_t> best_target;
+            std::optional<Rational> best_gap;
+            for (const auto target : candidates) {
+                if (!last_end[static_cast<std::size_t>(target)]) {
+                    return target;
+                }
                 const auto gap = beat - *last_end[
                     static_cast<std::size_t>(target)
                 ];
-                if (!best || *best_gap < gap) {
-                    best = target;
+                if (!best_target || *best_gap < gap) {
+                    best_target = target;
                     best_gap = gap;
                 }
             }
-            return best;
+            return best_target;
         };
 
         auto target = choose_target(*preferred);
@@ -1362,9 +1265,23 @@ static HoldProcessStats process_holds_stable(
                            ] < minimum_target_gap
                        )
                    )) {
-                if (!trim_best_capacity_conflict(beat)) {
-                    break;
+                const auto released_target = active_holds.front().target;
+                const auto hold_index = active_holds.front().note_index;
+                const auto same_start =
+                    active_holds.front().start == beat;
+                trim_hold_before(
+                    ordinary_notes, active_holds, active_sources,
+                    active_targets, 0, beat
+                );
+                last_end[static_cast<std::size_t>(released_target)] =
+                    endbeat_value(ordinary_notes[hold_index]).value_or(beat);
+                if (!same_start) {
+                    used_targets_this_beat[
+                        static_cast<std::size_t>(released_target)
+                    ] = false;
                 }
+                ++stats.trimmed_holds;
+                mapper_dirty = true;
                 rebuild_mapper();
                 target = choose_target(*preferred);
             }
@@ -1381,7 +1298,6 @@ static HoldProcessStats process_holds_stable(
 
         ordinary_notes[index]["column"] = *target;
         used_targets_this_beat[static_cast<std::size_t>(*target)] = true;
-        ++target_loads[static_cast<std::size_t>(*target)];
         if (!hold) {
             last_end[static_cast<std::size_t>(*target)] = beat;
             continue;
@@ -1407,7 +1323,8 @@ static std::pair<std::int64_t, std::int64_t> repair_short_target_gaps(
     const std::vector<std::vector<std::int64_t>>& matrix,
     std::int64_t source_columns,
     std::int64_t target_columns,
-    const Rational& minimum_input_gap
+    const Rational& minimum_input_gap,
+    std::vector<bool>& keep
 ) {
     std::vector<std::size_t> chronological_indexes;
     for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
@@ -1430,6 +1347,10 @@ static std::pair<std::int64_t, std::int64_t> repair_short_target_gaps(
     std::vector<std::vector<Rational>> target_times(
         static_cast<std::size_t>(target_columns)
     );
+    std::optional<Rational> current_beat_group;
+    std::vector<bool> used_targets_this_beat(
+        static_cast<std::size_t>(target_columns), false
+    );
     const auto minimum_target_gap =
         minimum_input_gap * target_columns / source_columns;
     std::int64_t changed = 0;
@@ -1437,6 +1358,11 @@ static std::pair<std::int64_t, std::int64_t> repair_short_target_gaps(
 
     for (const auto index : chronological_indexes) {
         const auto beat = *beat_value(ordinary_notes[index]);
+        if (!current_beat_group || !(*current_beat_group == beat)) {
+            current_beat_group = beat;
+            std::fill(used_targets_this_beat.begin(),
+                      used_targets_this_beat.end(), false);
+        }
         const auto source = source_by_index[index];
         const auto initial_target = *initial_targets[index];
         std::vector<std::int64_t> allowed_targets;
@@ -1452,6 +1378,11 @@ static std::pair<std::int64_t, std::int64_t> repair_short_target_gaps(
         }
 
         auto gap_for = [&](std::int64_t target) -> Gap {
+            if (used_targets_this_beat[
+                    static_cast<std::size_t>(target)
+                ]) {
+                return {false, Rational(0, 1)};
+            }
             const auto previous = nearest_previous_gap(target_times, target, beat);
             return previous ? Gap{false, *previous} : Gap{true, {}};
         };
@@ -1510,31 +1441,11 @@ static std::pair<std::int64_t, std::int64_t> repair_short_target_gaps(
 
             auto safe = choose_safe(candidates);
             if (!safe) {
-                std::sort(
-                    candidates.begin(), candidates.end(),
-                    [&](const Candidate& left, const Candidate& right) {
-                        if (!gap_equal(left.gap, right.gap)) {
-                            return gap_less(right.gap, left.gap);
-                        }
-                        const bool left_is_initial =
-                            left.target == initial_target;
-                        const bool right_is_initial =
-                            right.target == initial_target;
-                        if (left_is_initial != right_is_initial) {
-                            return left_is_initial;
-                        }
-                        const auto left_distance =
-                            std::llabs(left.target - initial_target);
-                        const auto right_distance =
-                            std::llabs(right.target - initial_target);
-                        if (left_distance != right_distance) {
-                            return left_distance < right_distance;
-                        }
-                        return left.target < right.target;
-                    }
-                );
-                chosen_target = candidates.front().target;
+                // No allowed target can preserve the minimum interval.
+                // Drop this later note instead of creating a dense streak.
+                keep[index] = false;
                 ++unresolved;
+                continue;
             } else {
                 chosen_target = *safe;
             }
@@ -1544,6 +1455,9 @@ static std::pair<std::int64_t, std::int64_t> repair_short_target_gaps(
         }
 
         ordinary_notes[index]["column"] = chosen_target;
+        used_targets_this_beat[
+            static_cast<std::size_t>(chosen_target)
+        ] = true;
         target_times[static_cast<std::size_t>(chosen_target)].push_back(beat);
     }
     return {changed, unresolved};
@@ -2269,7 +2183,7 @@ static void process_shape_path(
             }
         }
         target_count = std::clamp<std::int64_t>(
-            target_count, 0, target_columns
+            target_count, 1, target_columns
         );
 
         auto shape_locked_targets = locked_targets;
@@ -2281,14 +2195,6 @@ static void process_shape_path(
                 shape_locked_targets[static_cast<std::size_t>(target)] = true;
             }
         }
-        if (target_count == 0) {
-            for (const auto index : event.indexes) {
-                keep[index] = false;
-            }
-            target_shape_previous.clear();
-            continue;
-        }
-
         auto target_shape = choose_event_shape(
             source_shape, target_count, source_columns, target_columns,
             shape_locked_targets,
@@ -2732,7 +2638,7 @@ static void process_mc(
             }
             const auto repair = repair_short_target_gaps(
                 ordinary_notes, source_by_index, initial_targets, matrix,
-                source_columns, target_columns, minimum_input_gap
+                source_columns, target_columns, minimum_input_gap, keep
             );
             repaired = repair.first;
             unresolved = repair.second;
