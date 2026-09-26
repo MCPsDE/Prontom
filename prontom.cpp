@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.2";
+static constexpr const char* PRONTOM_VERSION = "2.1.4";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -1228,21 +1228,7 @@ static HoldProcessStats process_holds_stable(
                 }
             }
 
-            std::optional<std::int64_t> best_target;
-            std::optional<Rational> best_gap;
-            for (const auto target : candidates) {
-                if (!last_end[static_cast<std::size_t>(target)]) {
-                    return target;
-                }
-                const auto gap = beat - *last_end[
-                    static_cast<std::size_t>(target)
-                ];
-                if (!best_target || *best_gap < gap) {
-                    best_target = target;
-                    best_gap = gap;
-                }
-            }
-            return best_target;
+            return std::nullopt;
         };
 
         auto target = choose_target(*preferred);
