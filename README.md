@@ -2,13 +2,12 @@
 
 通用 Malody `.mc` 轨道映射工具。
 
-当前版本：`2.1.12`
+当前版本：`2.1.13`
 
 ## 用法
 
 ```text
-prontom.exe input.mc target_columns [lambda] [source_columns]
-prontom.exe input.mc target_columns [lambda] [source_columns] [local_gap_scale]
+prontom.exe input.mc target_columns [lambda] [local_gap_scale] [--ignoreLN|-i]
 prontom.exe --version
 ```
 
@@ -17,7 +16,7 @@ prontom.exe --version
 - `lambda=0`：严格使用旧的逐 note 映射路径。
 - `lambda>0`：使用事件级多对多键型转换；lambda 大于 1 时会进一步稀释降 K 事件。
 
-如果不提供 `source_columns`，程序读取 `meta.mode_ext.column`。
+源轨道数自动读取 `meta.mode_ext.column`。
 
 `local_gap_scale` 省略时默认为 `0`。它直接缩放局部最小间隔：
 
@@ -26,16 +25,18 @@ prontom.exe --version
 - `0.5`：局部间隔缩小为原来的 0.5 倍，放宽局部约束。
 - 更大的值：按比例增强局部约束。
 
-不提供 `source_columns` 时，可以直接把局部参数放在第四个参数位置，例如：
+局部参数直接放在第四个参数位置，例如：
 
 ```text
 prontom.exe input.mc 10 1 0.5
 ```
 
-如果第四个参数是整数，则继续按旧规则解释为 `source_columns`；同时指定两者时使用：
+`--ignoreLN` 或 `-i` 会忽略长条的冻结行为：带有 `endbeat` 的 note
+仍然保留 `endbeat`，但按普通米参与轨道映射，不再因为长条占用而冻结目标轨道。
+例如：
 
 ```text
-prontom.exe input.mc 10 1 4 0.5
+prontom.exe input.mc 10 0.5 0.5 -i
 ```
 
 输出文件会写成：

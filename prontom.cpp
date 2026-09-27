@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.12";
+static constexpr const char* PRONTOM_VERSION = "2.1.13";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -2168,6 +2168,7 @@ static void process_shape_path(
     std::int64_t target_columns,
     const Rational& minimum_input_gap,
     const std::map<Rational, Rational>& local_minimum_gaps,
+    bool ignore_ln,
     std::vector<bool>& keep
 ) {
     const auto events = build_shape_events(
@@ -2209,7 +2210,7 @@ static void process_shape_path(
         const auto shape_key = shape_signature(source_shape);
         std::vector<std::size_t> source_holds;
         for (const auto index : event.indexes) {
-            if (is_hold_note(ordinary_notes[index])) {
+            if (!ignore_ln && is_hold_note(ordinary_notes[index])) {
                 source_holds.push_back(index);
             }
         }
@@ -2331,7 +2332,7 @@ static void process_shape_path(
             ordinary_notes[index]["column"] = target;
             keep[index] = true;
             used_targets.insert(target);
-            if (is_hold_note(ordinary_notes[index])) {
+            if (!ignore_ln && is_hold_note(ordinary_notes[index])) {
                 ++selected_hold_count;
                 const auto end = *endbeat_value(ordinary_notes[index]);
                 locked_targets[static_cast<std::size_t>(target)] = true;
@@ -2358,11 +2359,15 @@ static void process_shape_path(
             auto clone = ordinary_notes[template_index];
             clone["column"] = target;
             const bool clone_is_hold =
-                added_hold_count > 0 && hold_endbeat_template.has_value();
-            if (clone_is_hold) {
-                clone["endbeat"] = *hold_endbeat_template;
-            } else {
-                clone.erase("endbeat");
+                !ignore_ln
+                && added_hold_count > 0
+                && hold_endbeat_template.has_value();
+            if (!ignore_ln) {
+                if (clone_is_hold) {
+                    clone["endbeat"] = *hold_endbeat_template;
+                } else {
+                    clone.erase("endbeat");
+                }
             }
             const auto clone_beat = beat_value(clone);
             if (!clone_beat
@@ -2398,7 +2403,8 @@ static std::int64_t repair_shape_spacing(
     std::vector<bool>& keep,
     std::int64_t target_columns,
     const Rational& minimum_input_gap,
-    const std::map<Rational, Rational>& local_minimum_gaps
+    const std::map<Rational, Rational>& local_minimum_gaps,
+    bool ignore_ln
 ) {
     std::vector<std::size_t> indexes;
     for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
@@ -2457,7 +2463,8 @@ static std::int64_t repair_shape_spacing(
 
         const auto current_target =
             ordinary_notes[index]["column"].get<std::int64_t>();
-        const auto hold = is_hold_note(ordinary_notes[index]);
+        const auto hold =
+            !ignore_ln && is_hold_note(ordinary_notes[index]);
         auto safe = [&](std::int64_t target) {
             if (used_this_beat[static_cast<std::size_t>(target)]
                 || locked[static_cast<std::size_t>(target)]) {
@@ -2549,7 +2556,8 @@ static void process_mc(
     std::int64_t target_columns,
     const Rational& lambda,
     std::optional<std::int64_t> source_columns_override,
-    const Rational& local_gap_scale
+    const Rational& local_gap_scale,
+    bool ignore_ln
 ) {
     std::ifstream input(input_path, std::ios::binary);
     if (!input) {
@@ -2696,11 +2704,11 @@ static void process_mc(
         process_shape_path(
             ordinary_notes, source_ranks, lambda,
             source_columns, target_columns, minimum_input_gap,
-            local_minimum_gaps, keep
+            local_minimum_gaps, ignore_ln, keep
         );
         repaired = repair_shape_spacing(
             ordinary_notes, keep, target_columns,
-            minimum_input_gap, local_minimum_gaps
+            minimum_input_gap, local_minimum_gaps, ignore_ln
         );
     } else {
         std::vector<std::int64_t> source_by_index(
@@ -2739,7 +2747,7 @@ static void process_mc(
         initial_targets[index] = target;
         }
 
-        if (has_holds) {
+        if (has_holds && !ignore_ln) {
             const auto dropped = process_holds_stable(
                 ordinary_notes, source_ranks, source_by_index,
                 source_columns, target_columns, minimum_input_gap,
@@ -2849,6 +2857,7 @@ static void process_mc(
               << "; lambda=" << rational_to_string(lambda)
               << "; local_gap_scale="
               << rational_to_string(local_gap_scale)
+              << "; ignoreLN=" << (ignore_ln ? "true" : "false")
               << "; output: " << output_text << '\n';
     if (invalid_columns) {
         std::cout << "Warning: skipped " << invalid_columns
@@ -2899,12 +2908,6 @@ static std::int64_t parse_positive_integer(const std::string& text,
     }
 }
 
-static bool is_local_gap_scale_argument(const std::string& text) {
-    return text == "0"
-        || text.find('.') != std::string::npos
-        || text.find('/') != std::string::npos;
-}
-
 #ifdef _WIN32
 static std::string utf8_from_wide(const wchar_t* value) {
     const auto size = WideCharToMultiByte(
@@ -2929,8 +2932,8 @@ static int run(int argc, const char* const* argv) {
     if (argc < 2) {
         std::cout << "Usage: prontom.exe input.mc\n"
                      "Optional non-interactive form: prontom.exe "
-                     "input.mc target_columns [lambda] [source_columns] "
-                     "[local_gap_scale]\n";
+                     "input.mc target_columns [lambda] [local_gap_scale] "
+                     "[--ignoreLN|-i]\n";
         return 1;
     }
 
@@ -2944,31 +2947,19 @@ static int run(int argc, const char* const* argv) {
     try {
         std::string target_text;
         Rational lambda(0, 1);
-        std::optional<std::int64_t> source_columns;
         Rational local_gap_scale(0, 1);
-        if (argc == 3) {
-            target_text = argv[2];
-        } else if (argc == 4) {
-            target_text = argv[2];
-            lambda = parse_lambda(argv[3]);
-        } else if (argc == 5) {
-            target_text = argv[2];
-            lambda = parse_lambda(argv[3]);
-            if (is_local_gap_scale_argument(argv[4])) {
-                local_gap_scale = parse_lambda(argv[4]);
+        bool ignore_ln = false;
+        std::vector<std::string> positional;
+        for (int index = 2; index < argc; ++index) {
+            const std::string argument = argv[index];
+            if (argument == "--ignoreLN" || argument == "-i") {
+                ignore_ln = true;
             } else {
-                source_columns = parse_positive_integer(
-                    argv[4], "Source lane count must be an integer"
-                );
+                positional.push_back(argument);
             }
-        } else if (argc == 6) {
-            target_text = argv[2];
-            lambda = parse_lambda(argv[3]);
-            source_columns = parse_positive_integer(
-                argv[4], "Source lane count must be an integer"
-            );
-            local_gap_scale = parse_lambda(argv[5]);
-        } else if (argc == 2) {
+        }
+
+        if (positional.empty() && argc == 2) {
             if (!std::getline(std::cin, target_text)) {
                 throw std::invalid_argument(
                     "Target lane count is required. Use: prontom.exe "
@@ -2976,18 +2967,27 @@ static int run(int argc, const char* const* argv) {
                 );
             }
         } else {
-            std::cout << "Usage: prontom.exe input.mc\n"
-                         "Optional non-interactive form: prontom.exe "
-                         "input.mc target_columns [lambda] [source_columns] "
-                         "[local_gap_scale]\n";
-            return 1;
+            if (positional.empty() || positional.size() > 3) {
+                std::cout << "Usage: prontom.exe input.mc\n"
+                             "Optional non-interactive form: prontom.exe "
+                             "input.mc target_columns [lambda] "
+                             "[local_gap_scale] [--ignoreLN|-i]\n";
+                return 1;
+            }
+            target_text = positional[0];
+            if (positional.size() >= 2) {
+                lambda = parse_lambda(positional[1]);
+            }
+            if (positional.size() >= 3) {
+                local_gap_scale = parse_lambda(positional[2]);
+            }
         }
         const auto target_columns = parse_positive_integer(
             target_text, "Target lane count must be an integer"
         );
         process_mc(
-            input_path, target_columns, lambda, source_columns,
-            local_gap_scale
+            input_path, target_columns, lambda, std::nullopt,
+            local_gap_scale, ignore_ln
         );
         return 0;
     } catch (const std::exception& error) {
