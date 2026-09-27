@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.9";
+static constexpr const char* PRONTOM_VERSION = "2.1.10";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -613,6 +613,18 @@ static bool gap_equal(const Gap& left, const Gap& right) {
         && (left.infinite || left.value == right.value);
 }
 
+static Rational minimum_gap_for_beat(
+    const Rational& global_gap,
+    const std::map<Rational, Rational>& local_minimum_gaps,
+    const Rational& beat
+) {
+    const auto it = local_minimum_gaps.find(beat);
+    if (it == local_minimum_gaps.end() || it->second < global_gap) {
+        return global_gap;
+    }
+    return it->second;
+}
+
 static std::optional<Rational> nearest_previous_gap(
     const std::vector<std::vector<Rational>>& target_times,
     std::int64_t target,
@@ -1046,6 +1058,7 @@ static HoldProcessStats process_holds_stable(
     std::int64_t source_columns,
     std::int64_t target_columns,
     const Rational& minimum_input_gap,
+    const std::map<Rational, Rational>& local_minimum_gaps,
     std::vector<bool>& keep
 ) {
     std::vector<std::size_t> chronological_indexes;
@@ -1193,6 +1206,9 @@ static HoldProcessStats process_holds_stable(
             continue;
         }
 
+        const auto required_gap = minimum_gap_for_beat(
+            minimum_target_gap, local_minimum_gaps, beat
+        );
         auto choose_target = [&](std::int64_t preferred_target)
             -> std::optional<std::int64_t> {
             std::vector<std::int64_t> candidates;
@@ -1222,7 +1238,7 @@ static HoldProcessStats process_holds_stable(
                     || !(
                         beat - *last_end[
                             static_cast<std::size_t>(target)
-                        ] < minimum_target_gap
+                        ] < required_gap
                     )) {
                     return target;
                 }
@@ -1238,7 +1254,7 @@ static HoldProcessStats process_holds_stable(
                     last_end[static_cast<std::size_t>(*target)]
                     && beat - *last_end[
                         static_cast<std::size_t>(*target)
-                    ] < minimum_target_gap
+                    ] < required_gap
                 )
             )) {
             while (!active_holds.empty()
@@ -1248,7 +1264,7 @@ static HoldProcessStats process_holds_stable(
                            last_end[static_cast<std::size_t>(*target)]
                            && beat - *last_end[
                                static_cast<std::size_t>(*target)
-                           ] < minimum_target_gap
+                           ] < required_gap
                        )
                    )) {
                 const auto released_target = active_holds.front().target;
@@ -1310,6 +1326,7 @@ static std::pair<std::int64_t, std::int64_t> repair_short_target_gaps(
     std::int64_t source_columns,
     std::int64_t target_columns,
     const Rational& minimum_input_gap,
+    const std::map<Rational, Rational>& local_minimum_gaps,
     std::vector<bool>& keep
 ) {
     std::vector<std::size_t> chronological_indexes;
@@ -1337,13 +1354,14 @@ static std::pair<std::int64_t, std::int64_t> repair_short_target_gaps(
     std::vector<bool> used_targets_this_beat(
         static_cast<std::size_t>(target_columns), false
     );
-    const auto minimum_target_gap =
-        minimum_input_gap;
     std::int64_t changed = 0;
     std::int64_t unresolved = 0;
 
     for (const auto index : chronological_indexes) {
         const auto beat = *beat_value(ordinary_notes[index]);
+        const auto minimum_target_gap = minimum_gap_for_beat(
+            minimum_input_gap, local_minimum_gaps, beat
+        );
         if (!current_beat_group || !(*current_beat_group == beat)) {
             current_beat_group = beat;
             std::fill(used_targets_this_beat.begin(),
@@ -1455,7 +1473,8 @@ static std::pair<std::int64_t, std::int64_t> repair_hold_results(
     std::vector<bool>& keep,
     std::int64_t source_columns,
     std::int64_t target_columns,
-    const Rational& minimum_input_gap
+    const Rational& minimum_input_gap,
+    const std::map<Rational, Rational>& local_minimum_gaps
 ) {
     std::vector<std::size_t> chronological_indexes;
     for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
@@ -1479,13 +1498,16 @@ static std::pair<std::int64_t, std::int64_t> repair_hold_results(
     std::vector<std::vector<Rational>> target_times(
         static_cast<std::size_t>(target_columns)
     );
-    const auto minimum_target_gap =
+    const auto base_minimum_target_gap =
         minimum_input_gap * target_columns / source_columns;
     std::int64_t changed = 0;
     std::int64_t dropped = 0;
 
     for (const auto index : chronological_indexes) {
         const auto beat = *beat_value(ordinary_notes[index]);
+        const auto minimum_target_gap = minimum_gap_for_beat(
+            base_minimum_target_gap, local_minimum_gaps, beat
+        );
         active_holds.erase(
             std::remove_if(
                 active_holds.begin(), active_holds.end(),
@@ -1576,6 +1598,11 @@ static std::pair<std::int64_t, std::int64_t> repair_hold_results(
                     candidates.end()
                 );
                 if (candidates.empty()) {
+                    keep[index] = false;
+                    ++dropped;
+                    continue;
+                }
+                if (base_minimum_target_gap < minimum_target_gap) {
                     keep[index] = false;
                     ++dropped;
                     continue;
@@ -2140,13 +2167,12 @@ static void process_shape_path(
     std::int64_t source_columns,
     std::int64_t target_columns,
     const Rational& minimum_input_gap,
+    const std::map<Rational, Rational>& local_minimum_gaps,
     std::vector<bool>& keep
 ) {
     const auto events = build_shape_events(
         ordinary_notes, source_ranks, minimum_input_gap
     );
-    const auto minimum_target_gap =
-        minimum_input_gap;
     std::vector<bool> locked_targets(
         static_cast<std::size_t>(target_columns), false
     );
@@ -2160,6 +2186,9 @@ static void process_shape_path(
 
     for (const auto& event : events) {
         const auto start = event.start;
+        const auto minimum_target_gap = minimum_gap_for_beat(
+            minimum_input_gap, local_minimum_gaps, start
+        );
         for (std::size_t index = 0; index < active_holds.size();) {
             if (!(active_holds[index].end <= start)) {
                 ++index;
@@ -2368,7 +2397,8 @@ static std::int64_t repair_shape_spacing(
     std::vector<json>& ordinary_notes,
     std::vector<bool>& keep,
     std::int64_t target_columns,
-    const Rational& minimum_target_gap
+    const Rational& minimum_input_gap,
+    const std::map<Rational, Rational>& local_minimum_gaps
 ) {
     std::vector<std::size_t> indexes;
     for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
@@ -2402,6 +2432,9 @@ static std::int64_t repair_shape_spacing(
 
     for (const auto index : indexes) {
         const auto beat = *beat_value(ordinary_notes[index]);
+        const auto minimum_target_gap = minimum_gap_for_beat(
+            minimum_input_gap, local_minimum_gaps, beat
+        );
         if (!current_beat || !(*current_beat == beat)) {
             current_beat = beat;
             std::fill(used_this_beat.begin(), used_this_beat.end(), false);
@@ -2465,6 +2498,10 @@ static std::int64_t repair_shape_spacing(
         }
 
         if (!selected) {
+            if (minimum_input_gap < minimum_target_gap) {
+                keep[index] = false;
+                continue;
+            }
             std::optional<Rational> best_gap;
             for (const auto target : candidates) {
                 if (used_this_beat[static_cast<std::size_t>(target)]
@@ -2574,6 +2611,7 @@ static void process_mc(
         static_cast<std::size_t>(source_columns)
     );
     std::vector<Rational> all_positive_gaps;
+    std::map<Rational, Rational> local_minimum_gaps;
     for (auto& indexes : indexes_by_source) {
         std::sort(
             indexes.begin(), indexes.end(),
@@ -2589,10 +2627,21 @@ static void process_mc(
                 return left < right;
             }
         );
+        std::optional<Rational> previous_source_beat;
         for (std::size_t rank = 0; rank < indexes.size(); ++rank) {
             const auto index = indexes[rank];
             source_ranks[index] = static_cast<std::int64_t>(rank);
             const auto current = beat_value(ordinary_notes[index]);
+            if (current && previous_source_beat) {
+                const auto local_gap = *current - *previous_source_beat;
+                if (Rational(0, 1) < local_gap) {
+                    const auto it = local_minimum_gaps.find(*current);
+                    if (it == local_minimum_gaps.end()
+                        || local_gap < it->second) {
+                        local_minimum_gaps[*current] = local_gap;
+                    }
+                }
+            }
             if (current && previous_beats[
                     static_cast<std::size_t>(
                         ordinary_notes[index]["column"].get<std::int64_t>()
@@ -2608,6 +2657,7 @@ static void process_mc(
                 }
             }
             if (current) {
+                previous_source_beat = current;
                 previous_beats[
                     static_cast<std::size_t>(
                         ordinary_notes[index]["column"].get<std::int64_t>()
@@ -2640,11 +2690,12 @@ static void process_mc(
     if (Rational(0, 1) < lambda) {
         process_shape_path(
             ordinary_notes, source_ranks, lambda,
-            source_columns, target_columns, minimum_input_gap, keep
+            source_columns, target_columns, minimum_input_gap,
+            local_minimum_gaps, keep
         );
         repaired = repair_shape_spacing(
             ordinary_notes, keep, target_columns,
-            minimum_input_gap
+            minimum_input_gap, local_minimum_gaps
         );
     } else {
         std::vector<std::int64_t> source_by_index(
@@ -2686,7 +2737,8 @@ static void process_mc(
         if (has_holds) {
             const auto dropped = process_holds_stable(
                 ordinary_notes, source_ranks, source_by_index,
-                source_columns, target_columns, minimum_input_gap, keep
+                source_columns, target_columns, minimum_input_gap,
+                local_minimum_gaps, keep
             );
             trimmed_holds = dropped.trimmed_holds;
             dropped_holds = dropped.dropped_holds;
@@ -2702,7 +2754,8 @@ static void process_mc(
             }
             const auto repair = repair_short_target_gaps(
                 ordinary_notes, source_by_index, initial_targets, matrix,
-                source_columns, target_columns, minimum_input_gap, keep
+                source_columns, target_columns, minimum_input_gap,
+                local_minimum_gaps, keep
             );
             repaired = repair.first;
             unresolved = repair.second;
