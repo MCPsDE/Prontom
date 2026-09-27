@@ -2,12 +2,13 @@
 
 通用 Malody `.mc` 轨道映射工具。
 
-当前版本：`2.1.10`
+当前版本：`2.1.11`
 
 ## 用法
 
 ```text
 prontom.exe input.mc target_columns [lambda] [source_columns]
+prontom.exe input.mc target_columns [lambda] [source_columns] [local_gap_scale]
 prontom.exe --version
 ```
 
@@ -17,6 +18,25 @@ prontom.exe --version
 - `lambda>0`：使用事件级多对多键型转换；lambda 大于 1 时会进一步稀释降 K 事件。
 
 如果不提供 `source_columns`，程序读取 `meta.mode_ext.column`。
+
+`local_gap_scale` 省略时默认为 `1`。它直接缩放局部最小间隔：
+
+- `1`：保持当前局部约束。
+- `0.5`：局部间隔缩小为原来的 0.5 倍，放宽局部约束。
+- `0`：关闭局部约束，行为等价于没有局部约束的上一版。
+- 更大的值：按比例增强局部约束。
+
+不提供 `source_columns` 时，可以直接把局部参数放在第四个参数位置，例如：
+
+```text
+prontom.exe input.mc 10 1 0.5
+```
+
+如果第四个参数是整数，则继续按旧规则解释为 `source_columns`；同时指定两者时使用：
+
+```text
+prontom.exe input.mc 10 1 4 0.5
+```
 
 输出文件会写成：
 

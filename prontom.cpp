@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.10";
+static constexpr const char* PRONTOM_VERSION = "2.1.11";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -2548,7 +2548,8 @@ static void process_mc(
     const std::filesystem::path& input_path,
     std::int64_t target_columns,
     const Rational& lambda,
-    std::optional<std::int64_t> source_columns_override
+    std::optional<std::int64_t> source_columns_override,
+    const Rational& local_gap_scale
 ) {
     std::ifstream input(input_path, std::ios::binary);
     if (!input) {
@@ -2634,11 +2635,15 @@ static void process_mc(
             const auto current = beat_value(ordinary_notes[index]);
             if (current && previous_source_beat) {
                 const auto local_gap = *current - *previous_source_beat;
-                if (Rational(0, 1) < local_gap) {
+                if (Rational(0, 1) < local_gap
+                    && Rational(0, 1) < local_gap_scale) {
+                    const auto scaled_local_gap =
+                        local_gap * local_gap_scale.numerator
+                        / local_gap_scale.denominator;
                     const auto it = local_minimum_gaps.find(*current);
                     if (it == local_minimum_gaps.end()
-                        || local_gap < it->second) {
-                        local_minimum_gaps[*current] = local_gap;
+                        || scaled_local_gap < it->second) {
+                        local_minimum_gaps[*current] = scaled_local_gap;
                     }
                 }
             }
@@ -2842,6 +2847,8 @@ static void process_mc(
               << target_columns << "K; period=" << period
               << "; version=" << PRONTOM_VERSION
               << "; lambda=" << rational_to_string(lambda)
+              << "; local_gap_scale="
+              << rational_to_string(local_gap_scale)
               << "; output: " << output_text << '\n';
     if (invalid_columns) {
         std::cout << "Warning: skipped " << invalid_columns
@@ -2892,6 +2899,12 @@ static std::int64_t parse_positive_integer(const std::string& text,
     }
 }
 
+static bool is_local_gap_scale_argument(const std::string& text) {
+    return text == "0"
+        || text.find('.') != std::string::npos
+        || text.find('/') != std::string::npos;
+}
+
 #ifdef _WIN32
 static std::string utf8_from_wide(const wchar_t* value) {
     const auto size = WideCharToMultiByte(
@@ -2916,7 +2929,8 @@ static int run(int argc, const char* const* argv) {
     if (argc < 2) {
         std::cout << "Usage: prontom.exe input.mc\n"
                      "Optional non-interactive form: prontom.exe "
-                     "input.mc target_columns [lambda] [source_columns]\n";
+                     "input.mc target_columns [lambda] [source_columns] "
+                     "[local_gap_scale]\n";
         return 1;
     }
 
@@ -2931,6 +2945,7 @@ static int run(int argc, const char* const* argv) {
         std::string target_text;
         Rational lambda(0, 1);
         std::optional<std::int64_t> source_columns;
+        Rational local_gap_scale(1, 1);
         if (argc == 3) {
             target_text = argv[2];
         } else if (argc == 4) {
@@ -2939,9 +2954,20 @@ static int run(int argc, const char* const* argv) {
         } else if (argc == 5) {
             target_text = argv[2];
             lambda = parse_lambda(argv[3]);
+            if (is_local_gap_scale_argument(argv[4])) {
+                local_gap_scale = parse_lambda(argv[4]);
+            } else {
+                source_columns = parse_positive_integer(
+                    argv[4], "Source lane count must be an integer"
+                );
+            }
+        } else if (argc == 6) {
+            target_text = argv[2];
+            lambda = parse_lambda(argv[3]);
             source_columns = parse_positive_integer(
                 argv[4], "Source lane count must be an integer"
             );
+            local_gap_scale = parse_lambda(argv[5]);
         } else if (argc == 2) {
             if (!std::getline(std::cin, target_text)) {
                 throw std::invalid_argument(
@@ -2952,13 +2978,17 @@ static int run(int argc, const char* const* argv) {
         } else {
             std::cout << "Usage: prontom.exe input.mc\n"
                          "Optional non-interactive form: prontom.exe "
-                         "input.mc target_columns [lambda] [source_columns]\n";
+                         "input.mc target_columns [lambda] [source_columns] "
+                         "[local_gap_scale]\n";
             return 1;
         }
         const auto target_columns = parse_positive_integer(
             target_text, "Target lane count must be an integer"
         );
-        process_mc(input_path, target_columns, lambda, source_columns);
+        process_mc(
+            input_path, target_columns, lambda, source_columns,
+            local_gap_scale
+        );
         return 0;
     } catch (const std::exception& error) {
         std::cout << "Error: " << error.what() << '\n';
