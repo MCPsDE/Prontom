@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.11";
+static constexpr const char* PRONTOM_VERSION = "2.1.12";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -2945,7 +2945,7 @@ static int run(int argc, const char* const* argv) {
         std::string target_text;
         Rational lambda(0, 1);
         std::optional<std::int64_t> source_columns;
-        Rational local_gap_scale(1, 1);
+        Rational local_gap_scale(0, 1);
         if (argc == 3) {
             target_text = argv[2];
         } else if (argc == 4) {
