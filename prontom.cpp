@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.14";
+static constexpr const char* PRONTOM_VERSION = "2.1.15";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -1059,6 +1059,7 @@ static HoldProcessStats process_holds_stable(
     std::int64_t target_columns,
     const Rational& minimum_input_gap,
     const std::map<Rational, Rational>& local_minimum_gaps,
+    bool ignore_ln,
     const std::optional<Rational>& prefix_end,
     std::vector<bool>& keep
 ) {
@@ -1196,7 +1197,8 @@ static HoldProcessStats process_holds_stable(
         expire_holds(beat);
 
         const auto source = source_by_index[index];
-        const bool hold = is_hold_note(ordinary_notes[index]);
+        const bool hold =
+            !ignore_ln && is_hold_note(ordinary_notes[index]);
         if (hold && active_sources[static_cast<std::size_t>(source)]) {
             trim_source_conflict(source, beat);
         }
@@ -2582,7 +2584,8 @@ static void process_mc(
     const Rational& lambda,
     std::optional<std::int64_t> source_columns_override,
     const Rational& local_gap_scale,
-    bool ignore_ln
+    bool ignore_ln,
+    bool global_hold_mapper
 ) {
     std::ifstream input(input_path, std::ios::binary);
     if (!input) {
@@ -2726,7 +2729,7 @@ static void process_mc(
     std::int64_t repaired = 0;
     std::int64_t unresolved = 0;
     std::optional<Rational> first_hold_beat;
-    if (has_holds && !ignore_ln) {
+    if (has_holds && !ignore_ln && !global_hold_mapper) {
         for (const auto& note : ordinary_notes) {
             if (!is_hold_note(note)) {
                 continue;
@@ -2784,14 +2787,18 @@ static void process_mc(
         initial_targets[index] = target;
         }
 
-        if (has_holds && !ignore_ln) {
+        if (global_hold_mapper || (has_holds && !ignore_ln)) {
+            std::optional<Rational> prefix_end;
+            if (!global_hold_mapper && has_holds && !ignore_ln) {
+                prefix_end = first_hold_beat;
+            }
             for (std::size_t index = 0;
                  index < ordinary_notes.size();
                  ++index) {
-                if (!initial_targets[index] || !first_hold_beat
+                if (!initial_targets[index] || !prefix_end
                     || !beat_value(ordinary_notes[index])
                     || !(*beat_value(ordinary_notes[index])
-                         < *first_hold_beat)) {
+                         < *prefix_end)) {
                     continue;
                 }
                 ordinary_notes[index]["column"] = *initial_targets[index];
@@ -2799,14 +2806,14 @@ static void process_mc(
             const auto prefix_repair = repair_short_target_gaps(
                 ordinary_notes, source_by_index, initial_targets, matrix,
                 source_columns, target_columns, minimum_input_gap,
-                local_minimum_gaps, first_hold_beat, keep
+                local_minimum_gaps, prefix_end, keep
             );
             repaired += prefix_repair.first;
             unresolved += prefix_repair.second;
             const auto dropped = process_holds_stable(
                 ordinary_notes, source_ranks, source_by_index,
                 source_columns, target_columns, minimum_input_gap,
-                local_minimum_gaps, first_hold_beat, keep
+                local_minimum_gaps, ignore_ln, prefix_end, keep
             );
             trimmed_holds = dropped.trimmed_holds;
             dropped_holds = dropped.dropped_holds;
@@ -2913,6 +2920,8 @@ static void process_mc(
               << "; local_gap_scale="
               << rational_to_string(local_gap_scale)
               << "; ignoreLN=" << (ignore_ln ? "true" : "false")
+              << "; globalHoldMapper="
+              << (global_hold_mapper ? "true" : "false")
               << "; output: " << output_text << '\n';
     if (invalid_columns) {
         std::cout << "Warning: skipped " << invalid_columns
@@ -2988,7 +2997,7 @@ static int run(int argc, const char* const* argv) {
         std::cout << "Usage: prontom.exe input.mc\n"
                      "Optional non-interactive form: prontom.exe "
                      "input.mc target_columns [lambda] [local_gap_scale] "
-                     "[--ignoreLN|-i]\n";
+                     "[--ignoreLN|-i] [--globalHoldMapper|-g]\n";
         return 1;
     }
 
@@ -3004,11 +3013,15 @@ static int run(int argc, const char* const* argv) {
         Rational lambda(0, 1);
         Rational local_gap_scale(0, 1);
         bool ignore_ln = false;
+        bool global_hold_mapper = false;
         std::vector<std::string> positional;
         for (int index = 2; index < argc; ++index) {
             const std::string argument = argv[index];
             if (argument == "--ignoreLN" || argument == "-i") {
                 ignore_ln = true;
+            } else if (argument == "--globalHoldMapper"
+                       || argument == "-g") {
+                global_hold_mapper = true;
             } else {
                 positional.push_back(argument);
             }
@@ -3026,7 +3039,8 @@ static int run(int argc, const char* const* argv) {
                 std::cout << "Usage: prontom.exe input.mc\n"
                              "Optional non-interactive form: prontom.exe "
                              "input.mc target_columns [lambda] "
-                             "[local_gap_scale] [--ignoreLN|-i]\n";
+                             "[local_gap_scale] [--ignoreLN|-i] "
+                             "[--globalHoldMapper|-g]\n";
                 return 1;
             }
             target_text = positional[0];
@@ -3042,7 +3056,7 @@ static int run(int argc, const char* const* argv) {
         );
         process_mc(
             input_path, target_columns, lambda, std::nullopt,
-            local_gap_scale, ignore_ln
+            local_gap_scale, ignore_ln, global_hold_mapper
         );
         return 0;
     } catch (const std::exception& error) {

@@ -2,12 +2,12 @@
 
 通用 Malody `.mc` 轨道映射工具。
 
-当前版本：`2.1.14`
+当前版本：`2.1.15`
 
 ## 用法
 
 ```text
-prontom.exe input.mc target_columns [lambda] [local_gap_scale] [--ignoreLN|-i]
+prontom.exe input.mc target_columns [lambda] [local_gap_scale] [--ignoreLN|-i] [--globalHoldMapper|-g]
 prontom.exe --version
 ```
 
@@ -38,6 +38,10 @@ prontom.exe input.mc 10 1 0.5
 ```text
 prontom.exe input.mc 10 0.5 0.5 -i
 ```
+
+`--globalHoldMapper` 或 `-g` 会强制使用含长条谱面的全局 mapper
+模式，即使输入是纯米。`-g -i` 同时启用时，长条字段保留但不参与冻结；
+删除输出 `endbeat` 后，与删除输入 `endbeat` 再使用 `-g` 的结果一致。
 
 输出文件会写成：
 
