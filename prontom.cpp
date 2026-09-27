@@ -23,7 +23,7 @@
 
 using json = nlohmann::ordered_json;
 
-static constexpr const char* PRONTOM_VERSION = "2.1.13";
+static constexpr const char* PRONTOM_VERSION = "2.1.14";
 
 struct Rational {
     std::int64_t numerator = 0;
@@ -1059,6 +1059,7 @@ static HoldProcessStats process_holds_stable(
     std::int64_t target_columns,
     const Rational& minimum_input_gap,
     const std::map<Rational, Rational>& local_minimum_gaps,
+    const std::optional<Rational>& prefix_end,
     std::vector<bool>& keep
 ) {
     std::vector<std::size_t> chronological_indexes;
@@ -1101,6 +1102,23 @@ static HoldProcessStats process_holds_stable(
     const auto minimum_target_gap =
         minimum_input_gap * target_columns / source_columns;
     HoldProcessStats stats;
+
+    if (prefix_end) {
+        for (const auto index : chronological_indexes) {
+            const auto beat = *beat_value(ordinary_notes[index]);
+            if (!(beat < *prefix_end) || !keep[index]) {
+                continue;
+            }
+            const auto target =
+                ordinary_notes[index]["column"].get<std::int64_t>();
+            const auto source = source_by_index[index];
+            if (!last_end[static_cast<std::size_t>(target)]
+                || *last_end[static_cast<std::size_t>(target)] < beat) {
+                last_end[static_cast<std::size_t>(target)] = beat;
+            }
+            ++source_counts[static_cast<std::size_t>(source)];
+        }
+    }
 
     auto rebuild_mapper = [&]() {
         std::vector<std::int64_t> free_sources;
@@ -1167,6 +1185,9 @@ static HoldProcessStats process_holds_stable(
 
     for (const auto index : chronological_indexes) {
         const auto beat = *beat_value(ordinary_notes[index]);
+        if (prefix_end && beat < *prefix_end) {
+            continue;
+        }
         if (!current_beat_group || !(*current_beat_group == beat)) {
             current_beat_group = beat;
             std::fill(used_targets_this_beat.begin(),
@@ -1327,11 +1348,15 @@ static std::pair<std::int64_t, std::int64_t> repair_short_target_gaps(
     std::int64_t target_columns,
     const Rational& minimum_input_gap,
     const std::map<Rational, Rational>& local_minimum_gaps,
+    const std::optional<Rational>& before_beat,
     std::vector<bool>& keep
 ) {
     std::vector<std::size_t> chronological_indexes;
     for (std::size_t index = 0; index < ordinary_notes.size(); ++index) {
-        if (initial_targets[index] && beat_value(ordinary_notes[index])) {
+        if (initial_targets[index] && keep[index]
+            && beat_value(ordinary_notes[index])
+            && (!before_beat
+                || *beat_value(ordinary_notes[index]) < *before_beat)) {
             chronological_indexes.push_back(index);
         }
     }
@@ -2700,6 +2725,18 @@ static void process_mc(
     std::int64_t dropped_locked_notes = 0;
     std::int64_t repaired = 0;
     std::int64_t unresolved = 0;
+    std::optional<Rational> first_hold_beat;
+    if (has_holds && !ignore_ln) {
+        for (const auto& note : ordinary_notes) {
+            if (!is_hold_note(note)) {
+                continue;
+            }
+            const auto beat = beat_value(note);
+            if (beat && (!first_hold_beat || *beat < *first_hold_beat)) {
+                first_hold_beat = *beat;
+            }
+        }
+    }
     if (Rational(0, 1) < lambda) {
         process_shape_path(
             ordinary_notes, source_ranks, lambda,
@@ -2748,10 +2785,28 @@ static void process_mc(
         }
 
         if (has_holds && !ignore_ln) {
+            for (std::size_t index = 0;
+                 index < ordinary_notes.size();
+                 ++index) {
+                if (!initial_targets[index] || !first_hold_beat
+                    || !beat_value(ordinary_notes[index])
+                    || !(*beat_value(ordinary_notes[index])
+                         < *first_hold_beat)) {
+                    continue;
+                }
+                ordinary_notes[index]["column"] = *initial_targets[index];
+            }
+            const auto prefix_repair = repair_short_target_gaps(
+                ordinary_notes, source_by_index, initial_targets, matrix,
+                source_columns, target_columns, minimum_input_gap,
+                local_minimum_gaps, first_hold_beat, keep
+            );
+            repaired += prefix_repair.first;
+            unresolved += prefix_repair.second;
             const auto dropped = process_holds_stable(
                 ordinary_notes, source_ranks, source_by_index,
                 source_columns, target_columns, minimum_input_gap,
-                local_minimum_gaps, keep
+                local_minimum_gaps, first_hold_beat, keep
             );
             trimmed_holds = dropped.trimmed_holds;
             dropped_holds = dropped.dropped_holds;
@@ -2768,7 +2823,7 @@ static void process_mc(
             const auto repair = repair_short_target_gaps(
                 ordinary_notes, source_by_index, initial_targets, matrix,
                 source_columns, target_columns, minimum_input_gap,
-                local_minimum_gaps, keep
+                local_minimum_gaps, std::nullopt, keep
             );
             repaired = repair.first;
             unresolved = repair.second;
